@@ -1,0 +1,30 @@
+llm:
+  provider: rulebased
+  openai_api_key: "${OPENAI_API_KEY:-}"
+  anthropic_api_key: "${ANTHROPIC_API_KEY:-}"
+  model: "gpt-4o"
+  temperature: 0.1
+
+vectordb:
+  provider: local
+  api_key: ""
+  index_name: "autoheal-failures"
+  base_path: "./vector_index"
+
+vcs:
+  provider: local
+  github_token: "${GITHUB_TOKEN:-}"
+  repo: "idcmurali1/Automation-test-framework-HOB"
+
+ci:
+  provider: local
+
+artifact_store:
+  path: "./artifacts"
+
+policy:
+  file: "./policies/policy.yaml"
+
+logging:
+  level: "INFO"
+  patch_ledger: "./patches/ledger.jsonl"
