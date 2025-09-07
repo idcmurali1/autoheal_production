@@ -1,4 +1,8 @@
 import argparse, os, json, subprocess
+# at top of autoheal/cli.py
+from .prompt_builder import PromptBuilder
+from .retriever_git import GitHistoryRetriever
+from .retriever import LocalRetriever
 from .logger import get_logger
 from .config import load_config
 from .artifact_store import ArtifactStore
