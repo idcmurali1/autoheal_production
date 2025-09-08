@@ -1,5 +1,5 @@
 
-from .retriever import SimpleRetriever
+from .retriever import LocalRetriever as SimpleRetriever
 def generate_locator_patch(old_id: str, html_text: str):
     retriever = SimpleRetriever(html_text)
     new_id = retriever.guess_replacement_for(old_id)
