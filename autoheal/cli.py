@@ -1,4 +1,5 @@
 # autoheal/cli.py
+from __future__ import annotations
 import argparse
 import json
 import os
@@ -21,7 +22,7 @@ from .ci_orchestrator import LocalCIOrchestrator
 
 # Mappings utilities
 from .mapping_updater import update_logical_name_across_modules
-from .identifier_extractor import extract_menu_settings_identifiers
+from .identifier_extractor import extract_identifiers  # <-- NEW import
 
 log = get_logger(__name__)
 
@@ -271,17 +272,23 @@ def update_mappings_from_app(
     github_token: str = "",
 ):
     """
-    Extract identifiers from the app source, then update every module mapping that
-    references `logical_name`. Still deterministic; RAG not required here.
+    Extract identifiers from the app source (multi-platform, config-driven),
+    then update every module mapping that references `logical_name`.
     """
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    ids = extract_menu_settings_identifiers(app_repo)
+    # NEW: use config-driven extractor that scans RN / iOS / Android files
+    ids = extract_identifiers(app_repo, config_path, logical_name)
     artifacts.put_json("identifiers_extracted.json", ids)
 
-    android_id = ids.get("android") or ""
-    ios_id = ids.get("ios") or ""
+    # Prefer platform-specific ids; fall back to RN testID for both platforms
+    android_id = ids.get("android") or ids.get("react_native") or ""
+    ios_id = ids.get("ios") or ids.get("react_native") or ""
+
+    if not android_id and not ios_id:
+        print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
+        return
 
     res = update_logical_name_across_modules(
         tests_repo=tests_repo,
@@ -293,7 +300,7 @@ def update_mappings_from_app(
     artifacts.put_json("identifiers_update_result.json", res)
 
     if res.get("updated", 0) == 0:
-        print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
+        print(json.dumps({"status": "noop", "message": "No files needed changes"}, indent=2))
         return
 
     if github_token:
@@ -364,7 +371,7 @@ def main():
     u.add_argument("--config", required=True)
     u.add_argument("--github_token", required=False)
 
-    # Extract IDs from app and update mappings
+    # Extract IDs from app and update mappings (multi-platform, config-driven)
     v = sub.add_parser(
         "update-mappings-from-app",
         help="Extract identifiers from app repo then update mappings (opens PR if token provided)",
