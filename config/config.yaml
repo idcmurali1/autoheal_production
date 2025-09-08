@@ -1,3 +1,14 @@
+app:
+  platform: react_native        # or ios_native / android_native
+  testid_to_logical:
+    product_sku_hoodie: us.mappings.yourOrders.hoodieProduct
+    product_sku_cap:    us.mappings.yourOrders.capProduct
+  ios_to_logical:
+    settingsButton:     us.mappings.account.menuSettingsButton
+  android_to_logical:
+    com.walmart.android.debug:id/account_header_settings: us.mappings.account.menuSettingsButton
+    product_sku_hoodie: us.mappings.yourOrders.hoodieProduct
+
 llm:
   provider: rulebased   # openai | anthropic | rulebased
   openai_api_key: "${OPENAI_API_KEY:-}"
