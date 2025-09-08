@@ -266,104 +266,72 @@ def update_mappings_by_name(
 def update_mappings_from_app(
     app_repo: str,
     tests_repo: str,
-    logical: str,                 # kept for CLI compatibility; not used when bulk-updating via config
+    logical: str,                 # optional filter
     branch: str,
     config_path: str,
     github_token: str = "",
 ):
     """
-    Scan the app source for identifiers (RN testIDs, iOS accessibilityIdentifier, Android ids/content-desc),
-    map them to logical names (from config), and update all YAML mappings across modules.
-    Opens a single PR with all updates when changes are found.
-
-    Expected config (examples):
-      app:
-        platform: react_native        # or ios_native / android_native
-        # For RN (testID -> logical name)
-        testid_to_logical:
-          product_sku_hoodie: us.mappings.yourOrders.hoodieProduct
-          product_sku_cap:    us.mappings.yourOrders.capProduct
-
-        # For iOS native (accessibilityIdentifier/name -> logical name)
-        ios_to_logical:
-          settingsButton:     us.mappings.account.menuSettingsButton
-
-        # For Android native (resource-id or content-desc -> logical name)
-        android_to_logical:
-          com.walmart.android.debug:id/account_header_settings: us.mappings.account.menuSettingsButton
-          product_sku_hoodie: us.mappings.yourOrders.hoodieProduct         # content-desc case
+    Scan app source (RN/iOS/Android) using config-driven source_files,
+    map discovered identifiers to logical names from config.app, and
+    update YAML mappings across modules. Opens one PR if changes exist.
     """
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # Read platform + mappings from config (all optional/flexible)
-    app_cfg = getattr(cfg, "app", None)
-    platform = getattr(app_cfg, "platform", "react_native")
+    # Read platform + maps from config
+    app_cfg = getattr(cfg, "app", None) or {}
+    platform     = getattr(app_cfg, "platform", "react_native")
+    rn_map       = getattr(app_cfg, "testid_to_logical", {})      # RN testID -> logical
+    ios_map      = getattr(app_cfg, "ios_to_logical", {})         # iOS id/name -> logical
+    android_map  = getattr(app_cfg, "android_to_logical", {})     # Android id/content-desc -> logical
 
-    rn_map       = getattr(app_cfg, "testid_to_logical", {})       # testID -> logical
-    ios_map      = getattr(app_cfg, "ios_to_logical", {})          # accessibilityIdentifier/name -> logical
-    android_map  = getattr(app_cfg, "android_to_logical", {})      # resource-id or content-desc -> logical
-
-    # Discover identifiers from the app
-    discovered = extract_identifiers(app_repo, platform)  # returns {'react_native':[...]} or {'ios_native':[...]} etc.
+    # NEW: call extractor with (app_repo, config_path, logical)
+    discovered = extract_identifiers(app_repo, config_path, logical)
+    # discovered: {"android": str|None, "ios": str|None, "react_native": str|None}
     artifacts.put_json("identifiers_discovered.json", discovered)
 
-    # Normalize discovered IDs list based on platform
-    if platform == "react_native":
-        ids = discovered.get("react_native", [])
-    elif platform == "ios_native":
-        ids = discovered.get("ios_native", [])
-    elif platform == "android_native":
-        ids = discovered.get("android_native", [])
-    else:
-        print(json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
-        return
-
-    # Build worklist of (logical_name, android_identifier, ios_identifier)
-    updates = []
+    updates = []  # list[(logical_name, android_identifier, ios_identifier)]
 
     if platform == "react_native":
-        # testID value -> cross-platform locators via helper
-        for testid in ids:
-            logical_name = rn_map.get(testid)
-            if not logical_name:
-                continue
-            locs = rn_value_to_platform_locators(testid)
-            updates.append((logical_name, locs["android"], locs["ios"]))
+        rn_id = discovered.get("react_native")
+        if rn_id:
+            logical_name = rn_map.get(rn_id)
+            if logical_name:
+                locs = rn_value_to_platform_locators(rn_id)
+                updates.append((logical_name, locs["android"], locs["ios"]))
 
     elif platform == "ios_native":
-        # iOS only; produce an XCUI-friendly locator (keep generic; your YAML already accepts XPath)
-        for ios_id in ids:
+        ios_id = discovered.get("ios")
+        if ios_id:
             logical_name = ios_map.get(ios_id)
-            if not logical_name:
-                continue
-            ios_locator = f"//*[@name='{ios_id}']"
-            updates.append((logical_name, "", ios_locator))
+            if logical_name:
+                ios_locator = f"//*[@name='{ios_id}']"
+                updates.append((logical_name, "", ios_locator))
 
     elif platform == "android_native":
-        # Android only; allow both resource-id and content-desc matches
-        for aid in ids:
-            logical_name = android_map.get(aid)
-            if not logical_name:
-                continue
-            android_locator = (
-                f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
-                if ":" not in aid else f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
-            )
-            updates.append((logical_name, android_locator, ""))
+        a_id = discovered.get("android")
+        if a_id:
+            logical_name = android_map.get(a_id)
+            if logical_name:
+                android_locator = (
+                    f"//*[@resource-id='{a_id}'] | //*[@content-desc='{a_id}']"
+                    if ":" in a_id else
+                    f"//*[@content-desc='{a_id}'] | //*[@resource-id='{a_id}']"
+                )
+                updates.append((logical_name, android_locator, ""))
 
-    # If user passed a single logical via CLI, we can filter to just that one
-    if logical and logical.strip() and updates:
-        updates = [u for u in updates if u[0] == logical.strip()]
+    # Optional: further restrict to a single logical passed via CLI
+    if logical and updates:
+        updates = [u for u in updates if u[0] == logical]
 
     if not updates:
         print(json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
         return
 
-    # Apply updates one by one, aggregating a summary
-    summary = {"attempted": len(updates), "updated_files": 0, "per_logical": []}
+    # Apply all updates
     total_changed = 0
-
+    summary = {"attempted": len(updates), "updated_files": 0, "per_logical": []}
     for logical_name, android_id, ios_id in updates:
         res = update_logical_name_across_modules(
             tests_repo=tests_repo,
@@ -372,16 +340,11 @@ def update_mappings_from_app(
             new_ios_identifier=ios_id,
             include_locale_files=True,
         )
-        summary["per_logical"].append(
-            {
-                "logical": logical_name,
-                "android": android_id,
-                "ios": ios_id,
-                "result": res,
-            }
-        )
         total_changed += res.get("updated", 0)
         summary["updated_files"] += res.get("updated", 0)
+        summary["per_logical"].append(
+            {"logical": logical_name, "android": android_id, "ios": ios_id, "result": res}
+        )
 
     artifacts.put_json("identifiers_update_summary.json", summary)
 
@@ -389,34 +352,30 @@ def update_mappings_from_app(
         print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
         return
 
-    # Single PR with all changes
+    # Open PR (single PR with all changes)
     if github_token:
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
-            commit_msg = "Auto-heal: update identifiers from app sources"
-            if logical and logical.strip():
-                commit_msg = f"Auto-heal: update identifiers for '{logical.strip()}' from app"
+            commit_msg = (
+                f"Auto-heal: update identifiers for '{logical}' from app"
+                if logical else "Auto-heal: update identifiers from app sources"
+            )
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
 
             from .github_client import GitHubClient
             gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(
-                title=commit_msg,
-                head=branch,
-                base="main",
-                body="Automated update based on app source changes",
-            )
+            pr = gh.open_pr(title=commit_msg, head=branch, base="main",
+                            body="Automated update based on app source changes")
             artifacts.put_json("pull_request.json", pr)
-            print(json.dumps({"status": "success", "pr": pr.get('html_url'), "changed": total_changed}, indent=2))
+            print(json.dumps({"status": "success", "pr": pr.get("html_url"), "changed": total_changed}, indent=2))
         except Exception as e:
-            print(json.dumps(
-                {"status": "partial", "message": "Updated locally; PR not opened", "error": str(e), "changed": total_changed},
-                indent=2,
-            ))
+            print(json.dumps({"status":"partial","message":"Updated locally; PR not opened",
+                              "error":str(e), "changed": total_changed}, indent=2))
     else:
-        print(json.dumps({"status": "success", "message": "Updated locally (no PR)", "changed": total_changed}, indent=2))
+        print(json.dumps({"status":"success","message":"Updated locally (no PR)",
+                          "changed": total_changed}, indent=2))
 
 
 def main():
