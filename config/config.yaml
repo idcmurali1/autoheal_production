@@ -1,5 +1,5 @@
 llm:
-  provider: rulebased
+  provider: rulebased   # openai | anthropic | rulebased
   openai_api_key: "${OPENAI_API_KEY:-}"
   anthropic_api_key: "${ANTHROPIC_API_KEY:-}"
   model: "gpt-4o"
@@ -28,3 +28,14 @@ policy:
 logging:
   level: "INFO"
   patch_ledger: "./patches/ledger.jsonl"
+
+source_files:
+  react_native:
+    - "src/catalog.ts"
+    - "src/menu.ts"
+  ios_native:
+    - "ios/Views/ProductView.swift"
+    - "ios/Controllers/MenuController.swift"
+  android_native:
+    - "android/app/src/main/java/com/walmart/app/CatalogActivity.java"
+    - "android/app/src/main/java/com/walmart/app/MenuActivity.java"
