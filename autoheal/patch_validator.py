@@ -1,5 +1,4 @@
 # autoheal/patch_validator.py
-
 from __future__ import annotations
 import os
 from typing import Dict, Any
@@ -42,3 +41,11 @@ class PatchValidator:
         # result["changed_lines"] = patch.get("changed_lines", 0)
 
         return result
+
+
+def apply_and_run(workspace: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Back-compat shim for ci_orchestrator.
+    Delegates to PatchValidator.validate().
+    """
+    return PatchValidator({}).validate(workspace, patch)
