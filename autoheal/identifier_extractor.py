@@ -1,38 +1,57 @@
-import os, re
+# autoheal/identifier_extractor.py
+import os, re, yaml
+from typing import Dict, Any
 
-def extract_menu_settings_identifiers(app_repo: str):
-    # naive scan for plausible identifiers
-    android_id = None
-    ios_id = None
+def load_source_files(config_path: str) -> Dict[str, Any]:
+    """Read config/config.yaml and return the source_files section"""
+    try:
+        cfg = yaml.safe_load(open(config_path, "r", encoding="utf-8"))
+        return cfg.get("source_files", {})
+    except Exception:
+        return {}
 
-    # Android: look for account_header_settings id
-    for dirpath, _, files in os.walk(app_repo):
-        for fn in files:
-            if fn.endswith((".xml", ".kt", ".java", ".tsx", ".jsx")):
-                path = os.path.join(dirpath, fn)
-                try:
-                    text = open(path, "r", encoding="utf-8", errors="ignore").read()
-                except Exception:
-                    continue
-                m = re.search(r'@\+id/(account_header_settings\w*)', text) or                     re.search(r'com\.walmart\.android\.debug:id/(account_header_settings\w*)', text)
-                if m:
-                    android_id = f"com.walmart.android.debug:id/{m.group(1)}"
-                    break
-        if android_id: break
+def extract_identifiers(app_repo: str, config_path: str, logical_name: str) -> Dict[str, str]:
+    """
+    Scan configured source files (React Native, iOS, Android) for identifiers.
+    logical_name is a hint (like 'menuSettingsButton' or 'hoodieproduct').
+    Returns {"android": "...", "ios": "...", "rn": "..."} if found.
+    """
+    source_files = load_source_files(config_path)
+    android_id, ios_id, rn_id = None, None, None
 
-    # iOS: simple search for settingsButton identifier
-    for dirpath, _, files in os.walk(app_repo):
-        for fn in files:
-            if fn.endswith((".swift", ".m", ".mm", ".tsx", ".jsx")):
-                path = os.path.join(dirpath, fn)
-                try:
-                    text = open(path, "r", encoding="utf-8", errors="ignore").read()
-                except Exception:
-                    continue
-                m = re.search(r'HeaderV\d+View\.settingsButton', text) or                     re.search(r'accessibilityIdentifier\s*=\s*"([A-Za-z0-9_\.]+)"', text)
-                if m:
-                    ios_id = m.group(0) if "." in m.group(0) else m.group(1)
-                    break
-        if ios_id: break
+    # React Native: look for testID="xxx"
+    for relpath in source_files.get("react_native", []):
+        path = os.path.join(app_repo, relpath)
+        if not os.path.exists(path): 
+            continue
+        text = open(path, "r", encoding="utf-8", errors="ignore").read()
+        m = re.search(rf'testID\s*=\s*"([^"]*{logical_name}[^"]*)"', text)
+        if m:
+            rn_id = m.group(1)
+            break
 
-    return {"android": android_id, "ios": ios_id}
+    # iOS Native: look for accessibilityIdentifier or Swift property
+    for relpath in source_files.get("ios_native", []):
+        path = os.path.join(app_repo, relpath)
+        if not os.path.exists(path): 
+            continue
+        text = open(path, "r", encoding="utf-8", errors="ignore").read()
+        m = re.search(rf'accessibilityIdentifier\s*=\s*"([^"]*{logical_name}[^"]*)"', text) \
+            or re.search(rf'{logical_name}\w*Button', text)
+        if m:
+            ios_id = m.group(1) if m.lastindex else m.group(0)
+            break
+
+    # Android Native: look for resource-ids
+    for relpath in source_files.get("android_native", []):
+        path = os.path.join(app_repo, relpath)
+        if not os.path.exists(path): 
+            continue
+        text = open(path, "r", encoding="utf-8", errors="ignore").read()
+        m = re.search(rf'@id/({logical_name}\w*)', text) \
+            or re.search(rf'com\.walmart\.android\.debug:id/({logical_name}\w*)', text)
+        if m:
+            android_id = f"com.walmart.android.debug:id/{m.group(1)}"
+            break
+
+    return {"android": android_id, "ios": ios_id, "react_native": rn_id}
