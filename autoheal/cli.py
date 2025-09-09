@@ -217,7 +217,7 @@ def update_mappings_from_app(
     artifacts.put_json("identifiers_discovered.json", discovered)
 
     # Normalize discovered IDs list
-        # Normalize discovered IDs list
+    
     if platform == "react_native":
         ids = discovered.get("react_native", [])
     elif platform == "ios_native":
