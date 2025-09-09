@@ -22,7 +22,12 @@ from .ci_orchestrator import LocalCIOrchestrator
 
 # Mappings utilities
 from .mapping_updater import update_logical_name_across_modules
-from .identifier_extractor import extract_identifiers, rn_value_to_platform_locators
+from .identifier_extractor import (
+    extract_identifiers,                 # expects: (app_repo, platform, config_path) -> {'react_native': [...]} etc.
+    rn_value_to_platform_locators,
+    choose_logical_for_rn,
+    choose_logical_generic,
+)
 
 log = get_logger(__name__)
 
@@ -266,64 +271,78 @@ def update_mappings_by_name(
 def update_mappings_from_app(
     app_repo: str,
     tests_repo: str,
-    logical: str,                 # optional filter
+    logical: str,                 # optional filter (keep for CLI compatibility)
     branch: str,
     config_path: str,
     github_token: str = "",
 ):
     """
     Scan app source (RN/iOS/Android) using config-driven source_files,
-    map discovered identifiers to logical names from config.app, and
-    update YAML mappings across modules. Opens one PR if changes exist.
+    map discovered identifiers to logical names from config.app (exact + regex + fuzzy),
+    and update YAML mappings across modules. Opens one PR if changes exist.
     """
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
     # Read platform + maps from config
-    app_cfg = getattr(cfg, "app", None) or {}
-    platform     = getattr(app_cfg, "platform", "react_native")
-    rn_map       = getattr(app_cfg, "testid_to_logical", {})      # RN testID -> logical
-    ios_map      = getattr(app_cfg, "ios_to_logical", {})         # iOS id/name -> logical
-    android_map  = getattr(app_cfg, "android_to_logical", {})     # Android id/content-desc -> logical
+    app_cfg = getattr(cfg, "app", {}) or {}
+    platform       = app_cfg.get("platform", "react_native")
 
-    # NEW: call extractor with (app_repo, config_path, logical)
-    discovered = extract_identifiers(app_repo, config_path, logical)
-    # discovered: {"android": str|None, "ios": str|None, "react_native": str|None}
+    # Exact maps + pattern lists (all optional)
+    rn_map           = app_cfg.get("testid_to_logical", {})      # RN testID -> logical
+    rn_patterns      = app_cfg.get("testid_patterns", [])        # list of {match, logical}
+    ios_exact        = app_cfg.get("ios_to_logical", {})         # iOS id/name -> logical
+    ios_patterns     = app_cfg.get("ios_patterns", [])           # list of {match, logical}
+    android_exact    = app_cfg.get("android_to_logical", {})     # Android id/content-desc -> logical
+    android_patterns = app_cfg.get("android_patterns", [])       # list of {match, logical}
+
+    # Discover identifiers from the app (platform-aware)
+    discovered = extract_identifiers(app_repo, platform, config_path)
     artifacts.put_json("identifiers_discovered.json", discovered)
 
-    updates = []  # list[(logical_name, android_identifier, ios_identifier)]
+    # Normalize discovered IDs list based on platform
+    if platform == "react_native":
+        ids = discovered.get("react_native", [])
+    elif platform == "ios_native":
+        ids = discovered.get("ios_native", [])
+    elif platform == "android_native":
+        ids = discovered.get("android_native", [])
+    else:
+        print(json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
+        return
+
+    updates = []  # list of (logical_name, android_identifier, ios_identifier)
 
     if platform == "react_native":
-        rn_id = discovered.get("react_native")
-        if rn_id:
-            logical_name = rn_map.get(rn_id)
-            if logical_name:
-                locs = rn_value_to_platform_locators(rn_id)
-                updates.append((logical_name, locs["android"], locs["ios"]))
+        for testid in ids:
+            logical_name = choose_logical_for_rn(testid, rn_map, rn_patterns)
+            if not logical_name:
+                continue
+            locs = rn_value_to_platform_locators(testid)
+            updates.append((logical_name, locs["android"], locs["ios"]))
 
     elif platform == "ios_native":
-        ios_id = discovered.get("ios")
-        if ios_id:
-            logical_name = ios_map.get(ios_id)
-            if logical_name:
-                ios_locator = f"//*[@name='{ios_id}']"
-                updates.append((logical_name, "", ios_locator))
+        for ios_id in ids:
+            logical_name = choose_logical_generic(ios_id, ios_exact, ios_patterns)
+            if not logical_name:
+                continue
+            ios_locator = f"//*[@name='{ios_id}']"
+            updates.append((logical_name, "", ios_locator))
 
     elif platform == "android_native":
-        a_id = discovered.get("android")
-        if a_id:
-            logical_name = android_map.get(a_id)
-            if logical_name:
-                android_locator = (
-                    f"//*[@resource-id='{a_id}'] | //*[@content-desc='{a_id}']"
-                    if ":" in a_id else
-                    f"//*[@content-desc='{a_id}'] | //*[@resource-id='{a_id}']"
-                )
-                updates.append((logical_name, android_locator, ""))
+        for aid in ids:
+            logical_name = choose_logical_generic(aid, android_exact, android_patterns)
+            if not logical_name:
+                continue
+            android_locator = (
+                f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
+                if ":" in aid else f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+            )
+            updates.append((logical_name, android_locator, ""))
 
     # Optional: further restrict to a single logical passed via CLI
-    if logical and updates:
-        updates = [u for u in updates if u[0] == logical]
+    if logical and logical.strip() and updates:
+        updates = [u for u in updates if u[0] == logical.strip()]
 
     if not updates:
         print(json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
@@ -358,24 +377,27 @@ def update_mappings_from_app(
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
             commit_msg = (
-                f"Auto-heal: update identifiers for '{logical}' from app"
-                if logical else "Auto-heal: update identifiers from app sources"
+                f"Auto-heal: update identifiers for '{logical.strip()}' from app"
+                if logical and logical.strip() else "Auto-heal: update identifiers from app sources"
             )
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
 
             from .github_client import GitHubClient
             gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(title=commit_msg, head=branch, base="main",
-                            body="Automated update based on app source changes")
+            pr = gh.open_pr(
+                title=commit_msg, head=branch, base="main",
+                body="Automated update based on app source changes"
+            )
             artifacts.put_json("pull_request.json", pr)
             print(json.dumps({"status": "success", "pr": pr.get("html_url"), "changed": total_changed}, indent=2))
         except Exception as e:
-            print(json.dumps({"status":"partial","message":"Updated locally; PR not opened",
-                              "error":str(e), "changed": total_changed}, indent=2))
+            print(json.dumps(
+                {"status": "partial", "message": "Updated locally; PR not opened", "error": str(e), "changed": total_changed},
+                indent=2,
+            ))
     else:
-        print(json.dumps({"status":"success","message":"Updated locally (no PR)",
-                          "changed": total_changed}, indent=2))
+        print(json.dumps({"status": "success", "message": "Updated locally (no PR)", "changed": total_changed}, indent=2))
 
 
 def main():
@@ -415,7 +437,7 @@ def main():
     )
     v.add_argument("--app_repo", required=True)
     v.add_argument("--tests_repo", required=True)
-    v.add_argument("--logical", required=True)
+    v.add_argument("--logical", required=True)   # optional filter, keeps CLI compat
     v.add_argument("--branch", required=True)
     v.add_argument("--config", required=True)
     v.add_argument("--github_token", required=False)
