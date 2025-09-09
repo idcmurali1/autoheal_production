@@ -1,3 +1,4 @@
+# autoheal/identifier_extractor.py
 from __future__ import annotations
 import os, re, yaml
 from typing import Dict, Any, List, Tuple, Optional
@@ -84,6 +85,10 @@ def map_by_fuzzy(value: str, exact_map: Dict[str, str]) -> Optional[str]:
 RN_TESTID_RE = re.compile(r"\btestID\s*[:=]\s*['\"]([^'\"\n]+)['\"]")
 
 def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
+    """
+    Collect all React Native testID values from configured files
+    (falls back to scanning the repo if not configured).
+    """
     files_cfg = load_source_files(config_path).get("react_native", [])
     files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
     if not files:
@@ -96,6 +101,9 @@ def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
     return list(seen.keys())
 
 def extract_ios_identifiers(app_repo: str, config_path: str) -> List[str]:
+    """
+    Collect iOS accessibilityIdentifier values; also capture common *SettingsButton names.
+    """
     files_cfg = load_source_files(config_path).get("ios_native", [])
     files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
     if not files:
@@ -113,6 +121,9 @@ def extract_ios_identifiers(app_repo: str, config_path: str) -> List[str]:
     return list(ios_ids.keys())
 
 def extract_android_identifiers(app_repo: str, config_path: str) -> List[str]:
+    """
+    Collect Android resource-ids and contentDescription values (and fully qualified debug ids).
+    """
     files_cfg = load_source_files(config_path).get("android_native", [])
     files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
     if not files:
@@ -162,7 +173,7 @@ def choose_logical_for_rn(testid: str, exact_map: Dict[str, str], patterns: List
     if m:
         return m
     return map_by_fuzzy(testid, exact_map)
-    
+
 def choose_logical_generic(
     value: str,
     exact_map: Dict[str, str],
@@ -178,19 +189,18 @@ def choose_logical_generic(
     # 1) exact match
     if value in exact_map:
         return exact_map[value]
-
     # 2) regex patterns
     m = map_by_patterns(value, patterns)
     if m:
         return m
-
     # 3) fuzzy fallback against keys in exact_map
-    return map_by_fuzzy(value, exact_map)    
+    return map_by_fuzzy(value, exact_map)
 
 __all__ = [
     "extract_identifiers",
     "load_source_files",
+    "load_app_mapping",
     "rn_value_to_platform_locators",
     "choose_logical_for_rn",
-    "choose_logical_generic",   # <-- add this
+    "choose_logical_generic",
 ]
