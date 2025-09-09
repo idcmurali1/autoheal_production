@@ -1,12 +1,12 @@
 app:
   platform: react_native  # or ios_native / android_native
 
-  # Optional: exact RN testID -> logical name overrides (highest priority)
+  # Exact RN testID -> logical (highest priority)
   testid_to_logical:
     product_sku_hoodie:  us.mappings.yourOrders.hoodieProduct
     product_sku_cap:     us.mappings.yourOrders.capProduct
 
-  # NEW: flexible families (regex); first match wins
+  # Flexible families (regex). Your *_val1 change is covered here.
   testid_patterns:
     - match: "^product_sku_hoodie.*$"
       logical: us.mappings.yourOrders.hoodieProduct
@@ -15,15 +15,18 @@ app:
     - match: "^product_sku_shirt.*$"
       logical: us.mappings.yourOrders.shirtProduct
 
-  # (Optional) Native iOS flexible families
   ios_patterns:
     - match: "^(settingsButton|.*SettingsButton.*)$"
       logical: us.mappings.account.menuSettingsButton
 
-  # (Optional) Native Android flexible families
+  # Split menu vs product patterns (don’t map hoodie to menu!)
   android_patterns:
-    - match: "^(com\\.walmart\\.android\\.debug:id/account_header_settings.*|product_sku_hoodie.*)$"
+    - match: "^com\\.walmart\\.android\\.debug:id/account_header_settings.*$"
       logical: us.mappings.account.menuSettingsButton
+    - match: "^product_sku_hoodie.*$"
+      logical: us.mappings.yourOrders.hoodieProduct
+    - match: "^product_sku_cap.*$"
+      logical: us.mappings.yourOrders.capProduct
 
 source_files:
   react_native:
@@ -37,7 +40,7 @@ source_files:
     - "android/app/src/main/java/com/walmart/app/MenuActivity.java"
 
 llm:
-  provider: rulebased   # openai | anthropic | rulebased
+  provider: rulebased
   openai_api_key: "${OPENAI_API_KEY:-}"
   anthropic_api_key: "${ANTHROPIC_API_KEY:-}"
   model: "gpt-4o"
@@ -66,14 +69,3 @@ policy:
 logging:
   level: "INFO"
   patch_ledger: "./patches/ledger.jsonl"
-
-source_files:
-  react_native:
-    - "src/catalog.ts"
-    - "src/menu.ts"
-  ios_native:
-    - "ios/Views/ProductView.swift"
-    - "ios/Controllers/MenuController.swift"
-  android_native:
-    - "android/app/src/main/java/com/walmart/app/CatalogActivity.java"
-    - "android/app/src/main/java/com/walmart/app/MenuActivity.java"
