@@ -1,13 +1,40 @@
 app:
-  platform: react_native        # or ios_native / android_native
+  platform: react_native  # or ios_native / android_native
+
+  # Optional: exact RN testID -> logical name overrides (highest priority)
   testid_to_logical:
-    product_sku_hoodie: us.mappings.yourOrders.hoodieProduct
-    product_sku_cap:    us.mappings.yourOrders.capProduct
-  ios_to_logical:
-    settingsButton:     us.mappings.account.menuSettingsButton
-  android_to_logical:
-    com.walmart.android.debug:id/account_header_settings: us.mappings.account.menuSettingsButton
-    product_sku_hoodie: us.mappings.yourOrders.hoodieProduct
+    product_sku_hoodie:  us.mappings.yourOrders.hoodieProduct
+    product_sku_cap:     us.mappings.yourOrders.capProduct
+
+  # NEW: flexible families (regex); first match wins
+  testid_patterns:
+    - match: "^product_sku_hoodie.*$"
+      logical: us.mappings.yourOrders.hoodieProduct
+    - match: "^product_sku_cap.*$"
+      logical: us.mappings.yourOrders.capProduct
+    - match: "^product_sku_shirt.*$"
+      logical: us.mappings.yourOrders.shirtProduct
+
+  # (Optional) Native iOS flexible families
+  ios_patterns:
+    - match: "^(settingsButton|.*SettingsButton.*)$"
+      logical: us.mappings.account.menuSettingsButton
+
+  # (Optional) Native Android flexible families
+  android_patterns:
+    - match: "^(com\\.walmart\\.android\\.debug:id/account_header_settings.*|product_sku_hoodie.*)$"
+      logical: us.mappings.account.menuSettingsButton
+
+source_files:
+  react_native:
+    - "src/catalog.ts"
+    - "src/menu.ts"
+  ios_native:
+    - "ios/Views/ProductView.swift"
+    - "ios/Controllers/MenuController.swift"
+  android_native:
+    - "android/app/src/main/java/com/walmart/app/CatalogActivity.java"
+    - "android/app/src/main/java/com/walmart/app/MenuActivity.java"
 
 llm:
   provider: rulebased   # openai | anthropic | rulebased
