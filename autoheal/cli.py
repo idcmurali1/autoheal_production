@@ -22,21 +22,19 @@ from .ci_orchestrator import LocalCIOrchestrator
 
 # Mappings utilities
 from .mapping_updater import update_logical_name_across_modules
+
+# Identifier discovery + mapping helpers
 from .identifier_extractor import (
-    extract_identifiers,                 # expects: (app_repo, platform, config_path) -> {'react_native': [...]} etc.
+    extract_identifiers,          # (app_repo, platform, config_path) -> {'react_native':[...]} etc.
     rn_value_to_platform_locators,
-    choose_logical_for_rn,
-    choose_logical_generic,
+    choose_logical_for_rn,        # exact → regex patterns → fuzzy
 )
 
 log = get_logger(__name__)
 
 
 def run(event: str, workspace: str, config_path: str):
-    """
-    Demo auto-heal pipeline for a CI event JSON.
-    Adds RAG context from LocalRetriever; falls back cleanly if not available.
-    """
+    """Demo auto-heal pipeline for a CI event JSON (kept as-is, with optional RAG)."""
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
@@ -82,47 +80,21 @@ def run(event: str, workspace: str, config_path: str):
     if result.get("ok"):
         orchestrator.auto_merge(workspace, patch, result)
         log.info("Patch auto-merged (local).")
-        print(
-            json.dumps(
-                {
-                    "status": "success",
-                    "message": "Auto-healed and merged",
-                    "validation": result,
-                },
-                indent=2,
-            )
-        )
+        print(json.dumps(
+            {"status": "success", "message": "Auto-healed and merged", "validation": result},
+            indent=2
+        ))
     else:
-        orchestrator.write_ledger(
-            {
-                "status": "failed",
-                "patch": patch,
-                "validation": result,
-                "workspace": workspace,
-            }
-        )
+        orchestrator.write_ledger({"status": "failed", "patch": patch, "validation": result, "workspace": workspace})
         raise SystemExit("Validation failed; patch not merged.")
 
 
-def heal_text_rename(
-    app_repo: str,
-    tests_repo: str,
-    old_text: str,
-    new_text: str,
-    branch: str,
-    config_path: str,
-    github_token: str = "",
-):
-    """
-    LLM-assisted bulk text rename with RAG context:
-      - Git history retriever (last 50 commits) to build prompt context
-      - Apply deterministic find/replace across tests repo
-      - Optionally open PR
-    """
+def heal_text_rename(app_repo: str, tests_repo: str, old_text: str, new_text: str,
+                     branch: str, config_path: str, github_token: str = ""):
+    """LLM-assisted bulk text rename with Git-history RAG."""
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # --- RAG: Git history context (best-effort) ---
     retrieved = []
     try:
         retr = GitHistoryRetriever(cfg.vectordb.base_path)
@@ -133,36 +105,24 @@ def heal_text_rename(
         retrieved = []
 
     prompt = PromptBuilder().build(
-        {
-            "test_name": "text_rename",
-            "logs": f"expected '{old_text}'",
-            "dom_snapshot_path": "",
-            "broken_locator": old_text,
-        },
+        {"test_name": "text_rename", "logs": f"expected '{old_text}'",
+         "dom_snapshot_path": "", "broken_locator": old_text},
         retrieved,
     )
     llm = get_llm(
-        cfg.llm.provider,
-        cfg.llm.openai_api_key,
-        cfg.llm.anthropic_api_key,
-        cfg.llm.model,
-        cfg.llm.temperature,
+        cfg.llm.provider, cfg.llm.openai_api_key, cfg.llm.anthropic_api_key, cfg.llm.model, cfg.llm.temperature
     )
     patch = llm.generate_patch(prompt)
     patch.update({"action": "text_rename", "from": old_text, "to": new_text})
     artifacts.put_json("patch_text_rename.json", patch)
 
-    # Deterministic application in tests repo
     res = find_and_replace_text(tests_repo, old_text, new_text)
     artifacts.put_json("text_rename_result.json", res)
 
-    # Best-effort: run tests if a common runner is present
     try:
         if os.path.exists(os.path.join(tests_repo, "package.json")):
             subprocess.run(["npm", "test", "--silent"], cwd=tests_repo, check=False)
-        elif os.path.exists(os.path.join(tests_repo, "pytest.ini")) or os.path.exists(
-            os.path.join(tests_repo, "tests")
-        ):
+        elif os.path.exists(os.path.join(tests_repo, "pytest.ini")) or os.path.exists(os.path.join(tests_repo, "tests")):
             subprocess.run([os.sys.executable, "-m", "pytest", "-q"], cwd=tests_repo, check=False)
         elif os.path.exists(os.path.join(tests_repo, "gradlew")):
             subprocess.run(["./gradlew", "test"], cwd=tests_repo, check=False)
@@ -174,51 +134,25 @@ def heal_text_rename(
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
-            subprocess.run(
-                ["git", "commit", "-m", f"Auto-heal: rename '{old_text}' -> '{new_text}'"],
-                cwd=tests_repo,
-                check=False,
-            )
+            subprocess.run(["git", "commit", "-m", f"Auto-heal: rename '{old_text}' -> '{new_text}'"],
+                           cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
-
             from .github_client import GitHubClient
-
             gh = GitHubClient(github_token, target_repo)
-            pr = gh.open_pr(
-                title=f"Auto-heal: rename '{old_text}' -> '{new_text}'",
-                head=branch,
-                base="main",
-                body="Automated patch",
-            )
+            pr = gh.open_pr(title=f"Auto-heal: rename '{old_text}' -> '{new_text}'",
+                            head=branch, base="main", body="Automated patch")
             artifacts.put_json("pull_request.json", pr)
             print(json.dumps({"status": "success", "pr": pr.get("html_url")}, indent=2))
         except Exception as e:
-            print(
-                json.dumps(
-                    {
-                        "status": "partial",
-                        "message": "Applied rename locally; PR not opened",
-                        "error": str(e),
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps({"status": "partial", "message": "Applied rename locally; PR not opened",
+                              "error": str(e)}, indent=2))
     else:
         print(json.dumps({"status": "success", "message": "Applied rename locally (no PR)"}, indent=2))
 
 
-def update_mappings_by_name(
-    tests_repo: str,
-    logical_name: str,
-    android_id: str,
-    ios_id: str,
-    branch: str,
-    config_path: str,
-    github_token: str = "",
-):
-    """
-    Deterministic updater: walk all modules and update identifier for a given logical name.
-    """
+def update_mappings_by_name(tests_repo: str, logical_name: str, android_id: str, ios_id: str,
+                            branch: str, config_path: str, github_token: str = ""):
+    """Deterministic updater: update identifier for a given logical name."""
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
@@ -239,68 +173,47 @@ def update_mappings_by_name(
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
-            subprocess.run(
-                ["git", "commit", "-m", f"Auto-heal: update '{logical_name}' identifiers"],
-                cwd=tests_repo,
-                check=False,
-            )
+            subprocess.run(["git", "commit", "-m", f"Auto-heal: update '{logical_name}' identifiers"],
+                           cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
-
             from .github_client import GitHubClient
-
             gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(
-                title=f"Auto-heal: update identifiers for {logical_name}",
-                head=branch,
-                base="main",
-                body="Bulk update across modules",
-            )
+            pr = gh.open_pr(title=f"Auto-heal: update identifiers for {logical_name}",
+                            head=branch, base="main", body="Bulk update across modules")
             artifacts.put_json("pull_request.json", pr)
             print(json.dumps({"status": "success", "pr": pr.get("html_url")}, indent=2))
         except Exception as e:
-            print(
-                json.dumps(
-                    {"status": "partial", "message": "Updated locally; PR not opened", "error": str(e)},
-                    indent=2,
-                )
-            )
+            print(json.dumps({"status": "partial", "message": "Updated locally; PR not opened",
+                              "error": str(e)}, indent=2))
     else:
         print(json.dumps({"status": "success", "message": "Updated locally (no PR)"}, indent=2))
 
 
-def update_mappings_from_app(
-    app_repo: str,
-    tests_repo: str,
-    logical: str,                 # optional filter (keep for CLI compatibility)
-    branch: str,
-    config_path: str,
-    github_token: str = "",
-):
+def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
+                             branch: str, config_path: str, github_token: str = ""):
     """
-    Scan app source (RN/iOS/Android) using config-driven source_files,
-    map discovered identifiers to logical names from config.app (exact + regex + fuzzy),
-    and update YAML mappings across modules. Opens one PR if changes exist.
+    Discover identifiers in app source (RN/iOS/Android), map to logical names using:
+      - exact maps (highest priority)
+      - regex patterns (flexible families)
+      - fuzzy fallback (_valN, Premium, trailing digits → base)
+    Then update YAML mappings across modules. Single PR with all changes.
     """
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # Read platform + maps from config
-    app_cfg = getattr(cfg, "app", {}) or {}
-    platform       = app_cfg.get("platform", "react_native")
+    # Read platform + mapping rules from config
+    app_cfg = getattr(cfg, "app", None) or {}
+    platform         = app_cfg.get("platform", "react_native")
+    rn_map           = app_cfg.get("testid_to_logical", {})          # exact RN testID -> logical
+    rn_patterns      = app_cfg.get("testid_patterns", [])            # list[{match, logical}]
+    ios_patterns     = app_cfg.get("ios_patterns", [])
+    android_patterns = app_cfg.get("android_patterns", [])
 
-    # Exact maps + pattern lists (all optional)
-    rn_map           = app_cfg.get("testid_to_logical", {})      # RN testID -> logical
-    rn_patterns      = app_cfg.get("testid_patterns", [])        # list of {match, logical}
-    ios_exact        = app_cfg.get("ios_to_logical", {})         # iOS id/name -> logical
-    ios_patterns     = app_cfg.get("ios_patterns", [])           # list of {match, logical}
-    android_exact    = app_cfg.get("android_to_logical", {})     # Android id/content-desc -> logical
-    android_patterns = app_cfg.get("android_patterns", [])       # list of {match, logical}
-
-    # Discover identifiers from the app (platform-aware)
+    # Discover identifiers
     discovered = extract_identifiers(app_repo, platform, config_path)
     artifacts.put_json("identifiers_discovered.json", discovered)
 
-    # Normalize discovered IDs list based on platform
+    # Normalize to list
     if platform == "react_native":
         ids = discovered.get("react_native", [])
     elif platform == "ios_native":
@@ -311,10 +224,14 @@ def update_mappings_from_app(
         print(json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
         return
 
-    updates = []  # list of (logical_name, android_identifier, ios_identifier)
+    updates = []  # (logical, android_locator, ios_locator)
 
     if platform == "react_native":
         for testid in ids:
+            # optional CLI filter (only consider testIDs that contain the hint)
+            if logical and logical.lower() not in testid.lower():
+                # still allow exact map to win if the hint is actually a logical name
+                pass
             logical_name = choose_logical_for_rn(testid, rn_map, rn_patterns)
             if not logical_name:
                 continue
@@ -322,33 +239,47 @@ def update_mappings_from_app(
             updates.append((logical_name, locs["android"], locs["ios"]))
 
     elif platform == "ios_native":
+        # simple pattern mapping (extend to exact if you want full parity)
         for ios_id in ids:
-            logical_name = choose_logical_generic(ios_id, ios_exact, ios_patterns)
-            if not logical_name:
-                continue
-            ios_locator = f"//*[@name='{ios_id}']"
-            updates.append((logical_name, "", ios_locator))
+            # first exact (if you add an ios_to_logical map), then patterns
+            logical_name = None
+            for p in ios_patterns:
+                try:
+                    if p.get("match") and re.search(p["match"], ios_id):
+                        logical_name = p.get("logical")
+                        break
+                except re.error:
+                    continue
+            if logical_name:
+                updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
 
     elif platform == "android_native":
         for aid in ids:
-            logical_name = choose_logical_generic(aid, android_exact, android_patterns)
-            if not logical_name:
-                continue
-            android_locator = (
-                f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
-                if ":" in aid else f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
-            )
-            updates.append((logical_name, android_locator, ""))
+            logical_name = None
+            for p in android_patterns:
+                try:
+                    if p.get("match") and re.search(p["match"], aid):
+                        logical_name = p.get("logical")
+                        break
+                except re.error:
+                    continue
+            if logical_name:
+                android_locator = (
+                    f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
+                    if ":" in aid else
+                    f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+                )
+                updates.append((logical_name, android_locator, ""))
 
-    # Optional: further restrict to a single logical passed via CLI
-    if logical and logical.strip() and updates:
-        updates = [u for u in updates if u[0] == logical.strip()]
+    # If user passed a specific logical via CLI, filter to just that one
+    if logical and updates:
+        updates = [u for u in updates if u[0] == logical]
 
     if not updates:
         print(json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
         return
 
-    # Apply all updates
+    # Apply updates
     total_changed = 0
     summary = {"attempted": len(updates), "updated_files": 0, "per_logical": []}
     for logical_name, android_id, ios_id in updates:
@@ -371,46 +302,39 @@ def update_mappings_from_app(
         print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
         return
 
-    # Open PR (single PR with all changes)
+    # Open PR
     if github_token:
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
-            commit_msg = (
-                f"Auto-heal: update identifiers for '{logical.strip()}' from app"
-                if logical and logical.strip() else "Auto-heal: update identifiers from app sources"
-            )
-            subprocess.run(["git", "commit", "-m", commit_msg], cwd=tests_repo, check=False)
+            title = f"Auto-heal: update identifiers from app sources"
+            if logical:
+                title = f"Auto-heal: update identifiers for '{logical}' from app"
+            subprocess.run(["git", "commit", "-m", title], cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
-
             from .github_client import GitHubClient
             gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(
-                title=commit_msg, head=branch, base="main",
-                body="Automated update based on app source changes"
-            )
+            pr = gh.open_pr(title=title, head=branch, base="main",
+                            body="Automated update based on app source changes")
             artifacts.put_json("pull_request.json", pr)
             print(json.dumps({"status": "success", "pr": pr.get("html_url"), "changed": total_changed}, indent=2))
         except Exception as e:
-            print(json.dumps(
-                {"status": "partial", "message": "Updated locally; PR not opened", "error": str(e), "changed": total_changed},
-                indent=2,
-            ))
+            print(json.dumps({"status": "partial", "message": "Updated locally; PR not opened",
+                              "error": str(e), "changed": total_changed}, indent=2))
     else:
-        print(json.dumps({"status": "success", "message": "Updated locally (no PR)", "changed": total_changed}, indent=2))
+        print(json.dumps({"status": "success", "message": "Updated locally (no PR)",
+                          "changed": total_changed}, indent=2))
 
 
 def main():
     ap = argparse.ArgumentParser(description="Autoheal CLI (LLM + RAG + deterministic updaters)")
     sub = ap.add_subparsers(dest="cmd")
 
-    # Demo CI pipeline
     r = sub.add_parser("run", help="Run the demo auto-heal pipeline on a CI event JSON")
-    r.add_argument("--event", required=True, help="Path to CI event JSON")
-    r.add_argument("--workspace", required=True, help="Workspace root")
-    r.add_argument("--config", required=True, help="Path to config.yaml")
+    r.add_argument("--event", required=True)
+    r.add_argument("--workspace", required=True)
+    r.add_argument("--config", required=True)
 
-    # Text rename flow (LLM + RAG + deterministic file change)
     t = sub.add_parser("heal-text-rename", help="Rename text in tests repo and (optionally) open a PR")
     t.add_argument("--app_repo", required=True)
     t.add_argument("--tests_repo", required=True)
@@ -420,7 +344,6 @@ def main():
     t.add_argument("--config", required=True)
     t.add_argument("--github_token", required=False)
 
-    # Deterministic mapping updater by logical name
     u = sub.add_parser("update-mappings-by-name", help="Update a logical name across all module mappings")
     u.add_argument("--tests_repo", required=True)
     u.add_argument("--logical", required=True)
@@ -430,51 +353,27 @@ def main():
     u.add_argument("--config", required=True)
     u.add_argument("--github_token", required=False)
 
-    # Extract IDs from app and update mappings (multi-platform, config-driven)
-    v = sub.add_parser(
-        "update-mappings-from-app",
-        help="Extract identifiers from app repo then update mappings (opens PR if token provided)",
-    )
+    v = sub.add_parser("update-mappings-from-app",
+                       help="Extract identifiers from app repo then update mappings (opens PR if token provided)")
     v.add_argument("--app_repo", required=True)
     v.add_argument("--tests_repo", required=True)
-    v.add_argument("--logical", required=True)   # optional filter, keeps CLI compat
+    v.add_argument("--logical", required=False, default="")  # optional filter
     v.add_argument("--branch", required=True)
     v.add_argument("--config", required=True)
     v.add_argument("--github_token", required=False)
 
     args = ap.parse_args()
-
     if args.cmd == "run":
         run(args.event, args.workspace, args.config)
     elif args.cmd == "heal-text-rename":
-        heal_text_rename(
-            args.app_repo,
-            args.tests_repo,
-            args.old,
-            args.new,
-            args.branch,
-            args.config,
-            args.github_token or "",
-        )
+        heal_text_rename(args.app_repo, args.tests_repo, args.old, args.new, args.branch, args.config,
+                         args.github_token or "")
     elif args.cmd == "update-mappings-by-name":
-        update_mappings_by_name(
-            args.tests_repo,
-            args.logical,
-            args.android_id,
-            args.ios_id,
-            args.branch,
-            args.config,
-            args.github_token or "",
-        )
+        update_mappings_by_name(args.tests_repo, args.logical, args.android_id, args.ios_id,
+                                args.branch, args.config, args.github_token or "")
     elif args.cmd == "update-mappings-from-app":
-        update_mappings_from_app(
-            args.app_repo,
-            args.tests_repo,
-            args.logical,
-            args.branch,
-            args.config,
-            args.github_token or "",
-        )
+        update_mappings_from_app(args.app_repo, args.tests_repo, args.logical,
+                                 args.branch, args.config, args.github_token or "")
     else:
         ap.print_help()
 
