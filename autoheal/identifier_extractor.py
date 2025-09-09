@@ -162,10 +162,35 @@ def choose_logical_for_rn(testid: str, exact_map: Dict[str, str], patterns: List
     if m:
         return m
     return map_by_fuzzy(testid, exact_map)
+    
+def choose_logical_generic(
+    value: str,
+    exact_map: Dict[str, str],
+    patterns: List[Dict[str, str]],
+) -> Optional[str]:
+    """
+    Generic chooser for iOS/Android identifiers:
+      1) exact match via exact_map
+      2) regex pattern list (patterns: [{match: 'regex', logical: '...'}])
+      3) fuzzy fallback using normalize_base/_valN/Premium/etc.
+    Returns the logical name or None.
+    """
+    # 1) exact match
+    if value in exact_map:
+        return exact_map[value]
+
+    # 2) regex patterns
+    m = map_by_patterns(value, patterns)
+    if m:
+        return m
+
+    # 3) fuzzy fallback against keys in exact_map
+    return map_by_fuzzy(value, exact_map)    
 
 __all__ = [
     "extract_identifiers",
     "load_source_files",
     "rn_value_to_platform_locators",
     "choose_logical_for_rn",
+    "choose_logical_generic",   # <-- add this
 ]
