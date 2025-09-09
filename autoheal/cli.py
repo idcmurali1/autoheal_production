@@ -1,6 +1,6 @@
 # autoheal/cli.py
-import re
 from __future__ import annotations
+import re
 import argparse
 import json
 import os
@@ -9,26 +9,23 @@ import subprocess
 from .logger import get_logger
 from .config import load_config
 from .artifact_store import ArtifactStore
-
 # LLM / RAG
 from .prompt_builder import PromptBuilder
 from .providers import get_llm
 from .retriever import LocalRetriever
 from .retriever_git import GitHistoryRetriever
-
 # Patch application / validation
 from .patch_strategies import find_and_replace_text
 from .patch_validator import PatchValidator
 from .ci_orchestrator import LocalCIOrchestrator
-
 # Mappings utilities
 from .mapping_updater import update_logical_name_across_modules
-
 # Identifier discovery + mapping helpers
 from .identifier_extractor import (
-    extract_identifiers,          # (app_repo, platform, config_path) -> {'react_native':[...]} etc.
+    extract_identifiers,
     rn_value_to_platform_locators,
-    choose_logical_for_rn,        # exact → regex patterns → fuzzy
+    choose_logical_for_rn,
+    choose_logical_generic,   # <-- add this
 )
 
 log = get_logger(__name__)
@@ -220,6 +217,7 @@ def update_mappings_from_app(
     artifacts.put_json("identifiers_discovered.json", discovered)
 
     # Normalize discovered IDs list
+        # Normalize discovered IDs list
     if platform == "react_native":
         ids = discovered.get("react_native", [])
     elif platform == "ios_native":
@@ -233,9 +231,7 @@ def update_mappings_from_app(
     updates = []  # list of (logical_name, android_identifier, ios_identifier)
 
     if platform == "react_native":
-        # For each RN testID, choose logical via exact -> pattern -> fuzzy
         for testid in ids:
-            from .identifier_extractor import choose_logical_for_rn, rn_value_to_platform_locators
             logical_name = choose_logical_for_rn(testid, rn_map, rn_patterns)
             if not logical_name:
                 continue
@@ -243,49 +239,29 @@ def update_mappings_from_app(
             updates.append((logical_name, locs["android"], locs["ios"]))
 
     elif platform == "ios_native":
-        # If you maintain ios_map or ios_patterns, resolve here; otherwise skip
-        ios_patterns = app_cfg.get("ios_patterns", [])
-        # simple resolver: exact first, then regex patterns
-        def _resolve_ios(v: str) -> str | None:
-            if v in ios_map:
-                return ios_map[v]
-            for p in ios_patterns:
-                try:
-                    if re.search(p.get("match", ""), v):
-                        return p.get("logical")
-                except re.error:
-                    pass
-            return None
-
         for ios_id in ids:
-            logical_name = _resolve_ios(ios_id)
-            if not logical_name:
-                continue
-            updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
+            logical_name = choose_logical_generic(
+                ios_id,
+                ios_map,
+                app_cfg.get("ios_patterns", []),
+            )
+            if logical_name:
+                updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
 
     elif platform == "android_native":
-        android_patterns = app_cfg.get("android_patterns", [])
-        def _resolve_android(v: str) -> str | None:
-            if v in android_map:
-                return android_map[v]
-            for p in android_patterns:
-                try:
-                    if re.search(p.get("match", ""), v):
-                        return p.get("logical")
-                except re.error:
-                    pass
-            return None
-
         for aid in ids:
-            logical_name = _resolve_android(aid)
-            if not logical_name:
-                continue
-            android_locator = (
-                f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
-                if ":" in aid else
-                f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+            logical_name = choose_logical_generic(
+                aid,
+                android_map,
+                app_cfg.get("android_patterns", []),
             )
-            updates.append((logical_name, android_locator, ""))
+            if logical_name:
+                android_locator = (
+                    f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
+                    if ":" in aid else
+                    f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+                )
+                updates.append((logical_name, android_locator, ""))
 
     # Optional: filter to a single logical if provided
     if logical and updates:
