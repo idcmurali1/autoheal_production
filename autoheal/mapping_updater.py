@@ -8,12 +8,18 @@ DEFAULT_FILES = [
     "mappings-ios-spanish.yaml",
 ]
 
-def _load_yaml(path: str):
+def _load_yaml(path: str) -> dict:
+    """Load YAML, normalizing tabs and returning a sentinel on parse errors."""
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
+    # normalize tabs to spaces (common cause of failures in CI)
     if "\t" in text:
         text = text.replace("\t", "  ")
-    return yaml.safe_load(text) or {}
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        # Return a sentinel so callers can decide to skip this file safely
+        return {"__PARSE_ERROR__": str(e)}
 
 def _save_yaml(path: str, obj) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -47,13 +53,14 @@ def update_logical_name_across_modules(
 ) -> Dict:
     root = os.path.join(tests_repo, modules_root)
     if not os.path.isdir(root):
-        return {"updated": 0, "files": [], "message": f"Modules dir not found: {root}"}
+        return {"updated": 0, "files": [], "skipped_bad_yaml": [], "message": f"Modules dir not found: {root}"}
 
     filenames = files_override or DEFAULT_FILES
     if not include_locale_files:
         filenames = [f for f in filenames if "spanish" not in f]
 
     results = []
+    skipped_bad_yaml = []
     updated_count = 0
 
     for module_dir in sorted(d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)):
@@ -69,6 +76,12 @@ def update_logical_name_across_modules(
                 continue
 
             doc = _load_yaml(path)
+            # Skip files that failed to parse; record the error
+            if isinstance(doc, dict) and "__PARSE_ERROR__" in doc:
+                skipped_bad_yaml.append({"file": path, "error": doc["__PARSE_ERROR__"]})
+                results.append({"file": path, "platform": platform, "changed": False, "skipped": True})
+                continue
+
             if platform == "android":
                 changed = _update_mapping(doc, "android", logical_name, new_android_identifier)
             elif platform == "ios":
@@ -79,8 +92,14 @@ def update_logical_name_across_modules(
             if changed:
                 _save_yaml(path, doc)
                 updated_count += 1
-                results.append({"file": path, "platform": platform, "changed": True})
+                results.append({"file": path, "platform": platform, "changed": True, "skipped": False})
             else:
-                results.append({"file": path, "platform": platform, "changed": False})
+                results.append({"file": path, "platform": platform, "changed": False, "skipped": False})
 
-    return {"updated": updated_count, "files": results, "logical_name": logical_name, "modules_root": root}
+    return {
+        "updated": updated_count,
+        "files": results,
+        "skipped_bad_yaml": skipped_bad_yaml,
+        "logical_name": logical_name,
+        "modules_root": root,
+    }
