@@ -189,31 +189,36 @@ def update_mappings_by_name(tests_repo: str, logical_name: str, android_id: str,
         print(json.dumps({"status": "success", "message": "Updated locally (no PR)"}, indent=2))
 
 
-def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
-                             branch: str, config_path: str, github_token: str = ""):
+def update_mappings_from_app(
+    app_repo: str,
+    tests_repo: str,
+    logical: str,                 # optional filter
+    branch: str,
+    config_path: str,
+    github_token: str = "",
+):
     """
-    Discover identifiers in app source (RN/iOS/Android), map to logical names using:
-      - exact maps (highest priority)
-      - regex patterns (flexible families)
-      - fuzzy fallback (_valN, Premium, trailing digits → base)
-    Then update YAML mappings across modules. Single PR with all changes.
+    Scan app source (RN/iOS/Android) using config-driven source_files,
+    map discovered identifiers to logical names from config.app, and
+    update YAML mappings across modules. Opens one PR if changes exist.
     """
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # Read platform + mapping rules from config
+    # Read platform + maps from config
     app_cfg = getattr(cfg, "app", None) or {}
-    platform         = app_cfg.get("platform", "react_native")
-    rn_map           = app_cfg.get("testid_to_logical", {})          # exact RN testID -> logical
-    rn_patterns      = app_cfg.get("testid_patterns", [])            # list[{match, logical}]
-    ios_patterns     = app_cfg.get("ios_patterns", [])
-    android_patterns = app_cfg.get("android_patterns", [])
+    platform = app_cfg.get("platform", "react_native")
 
-    # Discover identifiers
+    rn_map        = app_cfg.get("testid_to_logical", {})     # exact RN testID -> logical
+    rn_patterns   = app_cfg.get("testid_patterns", [])       # [{match: "...", logical: "..."}]
+    ios_map       = app_cfg.get("ios_to_logical", {})        # (optional) exact iOS id/name -> logical
+    android_map   = app_cfg.get("android_to_logical", {})    # (optional) exact Android id/desc -> logical
+
+    # Discover identifiers (lists) for the chosen platform
     discovered = extract_identifiers(app_repo, platform, config_path)
     artifacts.put_json("identifiers_discovered.json", discovered)
 
-    # Normalize to list
+    # Normalize discovered IDs list
     if platform == "react_native":
         ids = discovered.get("react_native", [])
     elif platform == "ios_native":
@@ -224,14 +229,12 @@ def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
         print(json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
         return
 
-    updates = []  # (logical, android_locator, ios_locator)
+    updates = []  # list of (logical_name, android_identifier, ios_identifier)
 
     if platform == "react_native":
+        # For each RN testID, choose logical via exact -> pattern -> fuzzy
         for testid in ids:
-            # optional CLI filter (only consider testIDs that contain the hint)
-            if logical and logical.lower() not in testid.lower():
-                # still allow exact map to win if the hint is actually a logical name
-                pass
+            from .identifier_extractor import choose_logical_for_rn, rn_value_to_platform_locators
             logical_name = choose_logical_for_rn(testid, rn_map, rn_patterns)
             if not logical_name:
                 continue
@@ -239,39 +242,51 @@ def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
             updates.append((logical_name, locs["android"], locs["ios"]))
 
     elif platform == "ios_native":
-        # simple pattern mapping (extend to exact if you want full parity)
-        for ios_id in ids:
-            # first exact (if you add an ios_to_logical map), then patterns
-            logical_name = None
+        # If you maintain ios_map or ios_patterns, resolve here; otherwise skip
+        ios_patterns = app_cfg.get("ios_patterns", [])
+        # simple resolver: exact first, then regex patterns
+        def _resolve_ios(v: str) -> str | None:
+            if v in ios_map:
+                return ios_map[v]
             for p in ios_patterns:
                 try:
-                    if p.get("match") and re.search(p["match"], ios_id):
-                        logical_name = p.get("logical")
-                        break
+                    if re.search(p.get("match", ""), v):
+                        return p.get("logical")
                 except re.error:
-                    continue
-            if logical_name:
-                updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
+                    pass
+            return None
+
+        for ios_id in ids:
+            logical_name = _resolve_ios(ios_id)
+            if not logical_name:
+                continue
+            updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
 
     elif platform == "android_native":
-        for aid in ids:
-            logical_name = None
+        android_patterns = app_cfg.get("android_patterns", [])
+        def _resolve_android(v: str) -> str | None:
+            if v in android_map:
+                return android_map[v]
             for p in android_patterns:
                 try:
-                    if p.get("match") and re.search(p["match"], aid):
-                        logical_name = p.get("logical")
-                        break
+                    if re.search(p.get("match", ""), v):
+                        return p.get("logical")
                 except re.error:
-                    continue
-            if logical_name:
-                android_locator = (
-                    f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
-                    if ":" in aid else
-                    f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
-                )
-                updates.append((logical_name, android_locator, ""))
+                    pass
+            return None
 
-    # If user passed a specific logical via CLI, filter to just that one
+        for aid in ids:
+            logical_name = _resolve_android(aid)
+            if not logical_name:
+                continue
+            android_locator = (
+                f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
+                if ":" in aid else
+                f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+            )
+            updates.append((logical_name, android_locator, ""))
+
+    # Optional: filter to a single logical if provided
     if logical and updates:
         updates = [u for u in updates if u[0] == logical]
 
@@ -279,7 +294,7 @@ def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
         print(json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
         return
 
-    # Apply updates
+    # Apply all updates across modules
     total_changed = 0
     summary = {"attempted": len(updates), "updated_files": 0, "per_logical": []}
     for logical_name, android_id, ios_id in updates:
@@ -302,27 +317,29 @@ def update_mappings_from_app(app_repo: str, tests_repo: str, logical: str,
         print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
         return
 
-    # Open PR
+    # Single PR with all changes
     if github_token:
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
             subprocess.run(["git", "add", "-A"], cwd=tests_repo, check=True)
-            title = f"Auto-heal: update identifiers from app sources"
-            if logical:
-                title = f"Auto-heal: update identifiers for '{logical}' from app"
-            subprocess.run(["git", "commit", "-m", title], cwd=tests_repo, check=False)
+            commit_msg = (
+                f"Auto-heal: update identifiers for '{logical}' from app"
+                if logical else "Auto-heal: update identifiers from app sources"
+            )
+            subprocess.run(["git", "commit", "-m", commit_msg], cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
+
             from .github_client import GitHubClient
             gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(title=title, head=branch, base="main",
+            pr = gh.open_pr(title=commit_msg, head=branch, base="main",
                             body="Automated update based on app source changes")
             artifacts.put_json("pull_request.json", pr)
             print(json.dumps({"status": "success", "pr": pr.get("html_url"), "changed": total_changed}, indent=2))
         except Exception as e:
-            print(json.dumps({"status": "partial", "message": "Updated locally; PR not opened",
-                              "error": str(e), "changed": total_changed}, indent=2))
+            print(json.dumps({"status":"partial","message":"Updated locally; PR not opened",
+                              "error":str(e), "changed": total_changed}, indent=2))
     else:
-        print(json.dumps({"status": "success", "message": "Updated locally (no PR)",
+        print(json.dumps({"status":"success","message":"Updated locally (no PR)",
                           "changed": total_changed}, indent=2))
 
 
