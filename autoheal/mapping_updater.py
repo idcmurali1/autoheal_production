@@ -1,17 +1,5 @@
-# autoheal/mapping_updater.py
-import os, glob
+import os, yaml, glob, re
 from typing import Dict, List, Optional
-
-# Try ruamel.yaml (best at preserving style), fall back to PyYAML.
-try:
-    from ruamel.yaml import YAML
-    _RYAML = YAML()
-    _RYAML.preserve_quotes = True
-    _RYAML.indent(mapping=2, sequence=2, offset=2)
-    _USE_RUAMEL = True
-except Exception:
-    _USE_RUAMEL = False
-import yaml  # keep for fallback load/dump
 
 DEFAULT_FILES = [
     "mappings-android.yaml",
@@ -21,36 +9,32 @@ DEFAULT_FILES = [
 ]
 
 def _load_yaml(path: str) -> dict:
-    """Load YAML, normalizing tabs and returning a sentinel on parse errors."""
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
-    if "\t" in text:  # normalize tabs → 2 spaces to avoid parse errors
+    if "\t" in text:
         text = text.replace("\t", "  ")
     try:
-        if _USE_RUAMEL:
-            from io import StringIO
-            return _RYAML.load(StringIO(text)) or {}
         return yaml.safe_load(text) or {}
-    except Exception as e:
-        return {"__PARSE_ERROR__": f"{e}"}
+    except yaml.YAMLError as e:
+        return {"__PARSE_ERROR__": str(e)}
 
 def _save_yaml(path: str, obj) -> None:
-    # Keep clean, wide lines with 2-space indent; avoid reflowing long XPaths.
-    if _USE_RUAMEL:
-        with open(path, "w", encoding="utf-8") as f:
-            _RYAML.width = 10_000
-            _RYAML.dump(obj, f)
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                obj,
-                f,
-                sort_keys=False,
-                allow_unicode=True,
-                indent=2,
-                width=10_000,  # prevent wrapping of long locators
-                default_flow_style=False,
-            )
+    # Prevent line wrapping / odd styles and keep 2-space indents.
+    yaml.safe_dump(
+        obj,
+        open(path, "w", encoding="utf-8"),
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        indent=2,
+        width=10**9,      # no wrapping
+    )
+
+_ws_re = re.compile(r"\s+")
+
+def _one_line(s: str) -> str:
+    # collapse all whitespace (incl. newlines) to single spaces
+    return _ws_re.sub(" ", s.strip())
 
 def _platform_from_filename(filename: str) -> Optional[str]:
     fn = filename.lower()
@@ -59,13 +43,13 @@ def _platform_from_filename(filename: str) -> Optional[str]:
     return None
 
 def _update_mapping(doc: dict, platform_key: str, logical_name: str, new_identifier: str) -> bool:
-    """Set identifier for the entry whose 'name' equals logical_name."""
     if platform_key not in doc or not isinstance(doc[platform_key], list):
         return False
     changed = False
+    new_identifier = _one_line(new_identifier)
     for item in doc[platform_key]:
         if isinstance(item, dict) and item.get("name") == logical_name:
-            if item.get("identifier") != new_identifier:
+            if _one_line(item.get("identifier", "")) != new_identifier:
                 item["identifier"] = new_identifier
                 changed = True
     return changed
@@ -87,8 +71,7 @@ def update_logical_name_across_modules(
     if not include_locale_files:
         filenames = [f for f in filenames if "spanish" not in f]
 
-    results = []
-    skipped_bad_yaml = []
+    results, skipped_bad_yaml = [], []
     updated_count = 0
 
     for module_dir in sorted(d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)):
@@ -104,7 +87,7 @@ def update_logical_name_across_modules(
                 continue
 
             doc = _load_yaml(path)
-            if "__PARSE_ERROR__" in doc:
+            if isinstance(doc, dict) and "__PARSE_ERROR__" in doc:
                 skipped_bad_yaml.append({"file": path, "error": doc["__PARSE_ERROR__"]})
                 results.append({"file": path, "platform": platform, "changed": False, "skipped": True})
                 continue
