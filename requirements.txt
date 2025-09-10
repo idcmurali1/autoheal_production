@@ -1,3 +1,4 @@
+ruamel.yaml>=0.18
 pyyaml
 requests
 scikit-learn>=1.4
