@@ -40,7 +40,7 @@ source_files:
     - "android/app/src/main/java/com/walmart/app/MenuActivity.java"
 
 llm:
-  provider: rulebased
+  provider: openai
   openai_api_key: "${OPENAI_API_KEY:-}"
   anthropic_api_key: "${ANTHROPIC_API_KEY:-}"
   model: "gpt-4o"
