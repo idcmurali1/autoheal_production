@@ -60,16 +60,15 @@ def map_by_patterns(value: str, patterns: List[Dict[str, str]]) -> Optional[str]
 def normalize_base(value: str) -> str:
     """
     Collapse common suffix variations so related IDs map to the same logical.
-    Examples:
-      product_sku_hoodie           -> product_sku_hoodie
-      product_sku_hoodiePremium    -> product_sku_hoodie
-      product_sku_hoodie_val1      -> product_sku_hoodie
-      product_sku_hoodie123        -> product_sku_hoodie
+      product_sku_cap_5454   -> product_sku_cap
+      product_sku_shirt_val2 -> product_sku_shirt
+      product_sku_hoodie123  -> product_sku_hoodie
     """
     v = value.strip()
-    v = re.sub(r"[_-]val\d+$", "", v, flags=re.IGNORECASE)   # _valNN
-    v = re.sub(r"\d+$", "", v)                               # trailing digits
+    v = re.sub(r"[_-]val\d+$", "", v, flags=re.IGNORECASE)  # _valNN or -valNN
+    v = re.sub(r"\d+$", "", v)                              # trailing digits
     v = re.sub(r"(Premium|Plus|Deluxe|V\d+)$", "", v, flags=re.IGNORECASE)
+    v = re.sub(r"[_-]+$", "", v)                            # <--- remove leftover trailing _ or -
     return v
 
 def map_by_fuzzy(value: str, exact_map: Dict[str, str]) -> Optional[str]:
@@ -82,7 +81,10 @@ def map_by_fuzzy(value: str, exact_map: Dict[str, str]) -> Optional[str]:
     return None
 
 # ---------------- Extractors ----------------
-RN_TESTID_RE = re.compile(r"\btestID\s*[:=]\s*['\"]([^'\"\n]+)['\"]")
+# Quoted strings: testID: 'x' | testID: "x" | testId = 'x'
+RN_TESTID_QUOTED = re.compile(r"\btest[Ii]d\s*[:=]\s*['\"]([^'\"\n]+)['\"]")
+# Template literals: testID: `x`
+RN_TESTID_TEMPLATE = re.compile(r"\btest[Ii]d\s*[:=]\s*`([^`\n]+)`")
 
 def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
     """
@@ -96,7 +98,10 @@ def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
 
     seen: Dict[str, None] = {}
     for p in files:
-        for m in RN_TESTID_RE.finditer(_read(p)):
+        txt = _read(p)
+        for m in RN_TESTID_QUOTED.finditer(txt):
+            seen.setdefault(m.group(1).strip(), None)
+        for m in RN_TESTID_TEMPLATE.finditer(txt):
             seen.setdefault(m.group(1).strip(), None)
     return list(seen.keys())
 
