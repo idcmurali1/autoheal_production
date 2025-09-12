@@ -388,80 +388,50 @@ def update_mappings_from_app(
 ):
     """
     Scan app source (RN/iOS/Android) using config-driven source_files,
-    map discovered identifiers to logical names from config.app, and
-    update YAML mappings across modules. Opens one PR if changes exist.
+    ask the LLM for any unmapped identifiers, merge with rule-based mappings,
+    then update YAML mappings across modules. Opens one PR if changes exist.
+    Produces the following artifacts at ./artifacts:
+
+      - config_app_snapshot.json
+      - identifiers_discovered.json
+      - identifiers_discovered_runtime.json
+      - llm_request_identifiers.json
+      - llm_response_identifiers.json
+      - identifiers_update_plan.json
+      - identifiers_update_summary.json
+      - rag_index_manifest_update_from_app.json
+      - pull_request.json (PR data or error)
+      - llm_info.json
     """
+    import shutil
+    import json as _json
+    from datetime import datetime
 
-    # Local helpers (kept here so this is drop-in)
-    import yaml  # local import to avoid top-level changes
-
-    def _get(obj, key, default):
-        if obj is None:
-            return default
-        try:
-            if isinstance(obj, dict):
-                return obj.get(key, default)
-            return getattr(obj, key, default)
-        except Exception:
-            return default
-
-    def _load_raw_app_cfg(path: str) -> dict:
-        try:
-            raw = yaml.safe_load(open(path, "r")) or {}
-            return raw.get("app", {}) or {}
-        except Exception:
-            return {}
-
-    # --- Load config + artifacts store ---
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # --- Load app mappings/patterns from RAW YAML (authoritative) with typed fallback ---
-    raw_app = _load_raw_app_cfg(config_path)
-    typed_app = getattr(cfg, "app", None)
+    # ---- Snapshot of the relevant app config for traceability
+    app_cfg = getattr(cfg, "app", None) or {}
+    platform = app_cfg.get("platform", "react_native")
+    rn_map        = app_cfg.get("testid_to_logical", {}) or {}
+    rn_patterns   = app_cfg.get("testid_patterns", []) or []
+    ios_map       = app_cfg.get("ios_to_logical", {}) or {}
+    android_map   = app_cfg.get("android_to_logical", {}) or {}
 
-    platform        = raw_app.get("platform") or _get(typed_app, "platform", "react_native")
-
-    rn_map          = raw_app.get("testid_to_logical")
-    if rn_map is None: rn_map = _get(typed_app, "testid_to_logical", {})
-    rn_map = rn_map or {}
-
-    rn_patterns     = raw_app.get("testid_patterns")
-    if rn_patterns is None: rn_patterns = _get(typed_app, "testid_patterns", [])
-    rn_patterns = rn_patterns or []
-
-    ios_map         = raw_app.get("ios_to_logical")
-    if ios_map is None: ios_map = _get(typed_app, "ios_to_logical", {})
-    ios_map = ios_map or {}
-
-    android_map     = raw_app.get("android_to_logical")
-    if android_map is None: android_map = _get(typed_app, "android_to_logical", {})
-    android_map = android_map or {}
-
-    ios_patterns    = raw_app.get("ios_patterns")
-    if ios_patterns is None: ios_patterns = _get(typed_app, "ios_patterns", [])
-    ios_patterns = ios_patterns or []
-
-    android_ptrns   = raw_app.get("android_patterns")
-    if android_ptrns is None: android_ptrns = _get(typed_app, "android_patterns", [])
-    android_ptrns = android_ptrns or []
-
-    # Snapshot what we actually loaded
     artifacts.put_json("config_app_snapshot.json", {
         "platform": platform,
-        "rn_map_keys": list(rn_map.keys()) if isinstance(rn_map, dict) else f"type={type(rn_map).__name__}",
-        "rn_patterns": rn_patterns,
-        "ios_map_keys": list(ios_map.keys()) if isinstance(ios_map, dict) else f"type={type(ios_map).__name__}",
-        "android_map_keys": list(android_map.keys()) if isinstance(android_map, dict) else f"type={type(android_map).__name__}",
-        "ios_patterns": ios_patterns,
-        "android_patterns": android_ptrns,
+        "testid_to_logical": rn_map,
+        "testid_patterns": rn_patterns,
+        "ios_to_logical": ios_map,
+        "android_to_logical": android_map,
+        "ts": datetime.utcnow().isoformat() + "Z",
     })
 
-    # --- Discover identifiers from app source ---
+    # ---- Identifier discovery
     discovered = extract_identifiers(app_repo, platform, config_path)
     artifacts.put_json("identifiers_discovered.json", discovered)
 
-    # Normalize discovered IDs list
+    # Normalize discovered IDs list by platform
     if platform == "react_native":
         ids = discovered.get("react_native", [])
     elif platform == "ios_native":
@@ -469,69 +439,60 @@ def update_mappings_from_app(
     elif platform == "android_native":
         ids = discovered.get("android_native", [])
     else:
-        print(json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
+        print(_json.dumps({"status": "noop", "message": f"Unknown platform '{platform}'"}, indent=2))
         return
 
-    # ---- DEBUG: record what the CLI is seeing before mapping ----
+    # ---- DEBUG: record what the CLI is seeing before mapping
     artifacts.put_json("identifiers_discovered_runtime.json", {
         "platform": platform,
         "ids": ids,
-        "rn_map_keys": list(rn_map.keys()) if isinstance(rn_map, dict) else [],
+        "rn_map_keys": list(rn_map.keys()),
         "rn_patterns": rn_patterns,
         "ios_map_keys": list(ios_map.keys()) if isinstance(ios_map, dict) else [],
         "android_map_keys": list(android_map.keys()) if isinstance(android_map, dict) else [],
     })
 
-    # --- Rule-based mapping first ---
-    updates = []           # list of (logical_name, android_identifier, ios_identifier)
-    rule_mapped = set()    # identifiers handled without LLM
+    # ---- Rule-based mapping (deterministic)
+    updates_rb = []  # list of (logical_name, android_identifier, ios_identifier)
+    rule_mapped = set()
 
     if platform == "react_native":
         for testid in ids:
-            logical_name = choose_logical_for_rn(testid, rn_map, rn_patterns)
-            if logical_name:
-                locs = rn_value_to_platform_locators(testid)  # {"android": "...", "ios": "..."}
-                updates.append((logical_name, locs["android"], locs["ios"]))
-                rule_mapped.add(testid)
+            ln = choose_logical_for_rn(testid, rn_map, rn_patterns)
+            if not ln:
+                continue
+            locs = rn_value_to_platform_locators(testid)
+            updates_rb.append((ln, locs["android"], locs["ios"]))
+            rule_mapped.add(testid)
 
     elif platform == "ios_native":
         for ios_id in ids:
-            logical_name = choose_logical_generic(ios_id, ios_map, ios_patterns)
-            if logical_name:
-                updates.append((logical_name, "", f"//*[@name='{ios_id}']"))
+            ln = choose_logical_generic(ios_id, ios_map, app_cfg.get("ios_patterns", []))
+            if ln:
+                updates_rb.append((ln, "", f"//*[@name='{ios_id}']"))
                 rule_mapped.add(ios_id)
 
     elif platform == "android_native":
         for aid in ids:
-            logical_name = choose_logical_generic(aid, android_map, android_ptrns)
-            if logical_name:
+            ln = choose_logical_generic(aid, android_map, app_cfg.get("android_patterns", []))
+            if ln:
                 android_locator = (
-                    f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']" if ":" in aid
-                    else f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
+                    f"//*[@resource-id='{aid}'] | //*[@content-desc='{aid}']"
+                    if ":" in aid else
+                    f"//*[@content-desc='{aid}'] | //*[@resource-id='{aid}']"
                 )
-                updates.append((logical_name, android_locator, ""))
+                updates_rb.append((ln, android_locator, ""))
                 rule_mapped.add(aid)
 
-    # --- Anything left goes to LLM ---
+    # ---- LLM for any still-unmapped identifiers
     unmapped = [i for i in ids if i not in rule_mapped]
 
-    # LLM usage log/artifact (even if we don't end up calling it; helps observability)
-    log.info(f"LLM provider={cfg.llm.provider} model={cfg.llm.model}")
-    _write_llm_info_artifact(artifacts, cfg.llm.provider, cfg.llm.model, cfg.llm.temperature)
-
-    # Snapshot the vector index folder (best-effort transparency)
-    _dump_vectordb_manifest(cfg.vectordb.base_path, artifacts, name="rag_index_manifest_update_from_app.json")
-
+    llm_suggestions = []
     if unmapped:
-        # Build a tiny context the LLM can use (prior mappings/patterns)
-        llm_context = {
-            "rn_map": rn_map,
-            "rn_patterns": rn_patterns,
-            "ios_map": ios_map,
-            "android_map": android_map,
-        }
+        # LLM usage log/artifact
+        log.info(f"LLM provider={cfg.llm.provider} model={cfg.llm.model}")
+        _write_llm_info_artifact(artifacts, cfg.llm.provider, cfg.llm.model, cfg.llm.temperature)
 
-        # Acquire LLM and call it
         llm = get_llm(
             cfg.llm.provider,
             cfg.llm.openai_api_key,
@@ -539,57 +500,68 @@ def update_mappings_from_app(
             cfg.llm.model,
             cfg.llm.temperature,
         )
-        llm_suggestions = _call_llm_for_mappings(llm, artifacts, platform, unmapped, llm_context)
 
-        # Normalize suggestions into updates
-        for s in llm_suggestions or []:
-            ident = s.get("identifier") or s.get("id") or s.get("testid")
-            logical_name = s.get("logical") or s.get("logical_name")
-            if not ident or not logical_name:
-                continue
+        # Call and capture artifacts
+        llm_req = {
+            "task": "map_identifiers",
+            "platform": platform,
+            "identifiers": unmapped,
+            "context": {
+                "rn_map": rn_map, "rn_patterns": rn_patterns,
+                "ios_map": ios_map, "android_map": android_map,
+            },
+        }
+        artifacts.put_json("llm_request_identifiers.json", llm_req)
+        resp = llm.generate_patch({
+            "instruction": "Suggest logical names and stable platform locators for the given identifiers.",
+            **llm_req
+        })
+        artifacts.put_json("llm_response_identifiers.json", resp)
 
-            android_id = s.get("android", "")
-            ios_id = s.get("ios", "")
+        if isinstance(resp, dict) and isinstance(resp.get("suggestions"), list):
+            llm_suggestions = resp["suggestions"]
+        elif isinstance(resp, list):
+            llm_suggestions = resp
+        else:
+            llm_suggestions = []
 
-            # If RN and missing locators, synthesize RN locators
-            if platform == "react_native":
-                if not android_id or not ios_id:
-                    locs = rn_value_to_platform_locators(ident)
-                    android_id = android_id or locs["android"]
-                    ios_id = ios_id or locs["ios"]
-            elif platform == "ios_native":
-                if not ios_id:
-                    ios_id = f"//*[@name='{ident}']"
-            elif platform == "android_native":
-                if not android_id:
-                    android_id = (
-                        f"//*[@resource-id='{ident}'] | //*[@content-desc='{ident}']" if ":" in ident
-                        else f"//*[@content-desc='{ident}'] | //*[@resource-id='{ident}']"
-                    )
+    # ---- Merge rule-based + LLM suggestions into a single update list
+    updates = list(updates_rb)
 
-            updates.append((logical_name, android_id, ios_id))
-
-    # ---- Plan artifact (what we intend to write) ----
-    artifacts.put_json("identifiers_update_plan.json", {
-        "attempted_count": len(ids),
-        "rule_mapped_count": len(rule_mapped),
-        "planned_updates": [
-            {"logical": u[0], "android": u[1], "ios": u[2]} for u in updates
-        ]
-    })
+    # Normalize LLM suggestions into (logical, android, ios)
+    seen = {(u[0], u[1], u[2]) for u in updates}  # de-dupe on the full triple
+    for s in llm_suggestions:
+        ident = s.get("identifier", "")
+        ln    = s.get("logical", "")
+        andr  = s.get("android", "") or ""
+        ios   = s.get("ios", "") or ""
+        if not ln:
+            continue
+        tpl = (ln, andr, ios)
+        if tpl not in seen:
+            updates.append(tpl)
+            seen.add(tpl)
 
     # Optional: filter to a single logical if provided
-    if logical:
+    if logical and updates:
         updates = [u for u in updates if u[0] == logical]
 
+    # ---- Plan/debug artifacts (what we intend to change)
+    artifacts.put_json("identifiers_update_plan.json", {
+        "attempted_count": len(updates),
+        "planned_updates": [{"logical": u[0], "android": u[1], "ios": u[2]} for u in updates],
+    })
+
+    # Also snapshot the vector index folder for transparency
+    _dump_vectordb_manifest(cfg.vectordb.base_path, artifacts, name="rag_index_manifest_update_from_app.json")
+
     if not updates:
-        print(json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
+        print(_json.dumps({"status": "noop", "message": "No mapped identifiers found to update"}, indent=2))
         return
 
-    # --- Apply updates across modules ---
+    # ---- Apply updates across test repo
     total_changed = 0
     summary = {"attempted": len(updates), "updated_files": 0, "per_logical": []}
-
     for logical_name, android_id, ios_id in updates:
         res = update_logical_name_across_modules(
             tests_repo=tests_repo,
@@ -598,9 +570,8 @@ def update_mappings_from_app(
             new_ios_identifier=ios_id,
             include_locale_files=True,
         )
-        changed = res.get("updated", 0)
-        total_changed += changed
-        summary["updated_files"] += changed
+        total_changed += res.get("updated", 0)
+        summary["updated_files"] += res.get("updated", 0)
         summary["per_logical"].append(
             {"logical": logical_name, "android": android_id, "ios": ios_id, "result": res}
         )
@@ -608,10 +579,10 @@ def update_mappings_from_app(
     artifacts.put_json("identifiers_update_summary.json", summary)
 
     if total_changed == 0:
-        print(json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
+        print(_json.dumps({"status": "noop", "message": "No identifier change detected"}, indent=2))
         return
 
-    # --- Single PR with all changes (if token provided) ---
+    # ---- Single PR with all changes
     if github_token:
         try:
             subprocess.run(["git", "checkout", "-b", branch], cwd=tests_repo, check=False)
@@ -623,18 +594,44 @@ def update_mappings_from_app(
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=tests_repo, check=False)
             subprocess.run(["git", "push", "-u", "origin", branch], cwd=tests_repo, check=True)
 
-            from .github_client import GitHubClient
-            gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
-            pr = gh.open_pr(title=commit_msg, head=branch, base="main",
-                            body="Automated update based on app source changes")
-            artifacts.put_json("pull_request.json", pr)
-            print(json.dumps({"status": "success", "pr": pr.get("html_url"), "changed": total_changed}, indent=2))
+            # Try API client first
+            pr_url = None
+            try:
+                from .github_client import GitHubClient
+                gh = GitHubClient(github_token, "idcmurali1/Automation-test-framework-HOB")
+                pr = gh.open_pr(title=commit_msg, head=branch, base="main",
+                                body="Automated update based on app source changes")
+                artifacts.put_json("pull_request.json", pr)
+                pr_url = (pr or {}).get("html_url")
+            except Exception as e:
+                artifacts.put_json("pull_request.json", {"error": str(e)})
+
+            # Fallback: gh CLI if API returned error or no URL
+            if not pr_url and shutil.which("gh"):
+                env = os.environ.copy()
+                env["GH_TOKEN"] = github_token
+                cmd = [
+                    "gh", "pr", "create",
+                    "--title", commit_msg,
+                    "--body", "Automated update based on app source changes",
+                    "--base", "main",
+                    "--head", branch,
+                ]
+                r = subprocess.run(cmd, cwd=tests_repo, env=env, capture_output=True, text=True, check=False)
+                # gh prints URL on success
+                line = (r.stdout.strip() or r.stderr.strip())
+                if line:
+                    pr_url = line.splitlines()[-1].strip()
+                    artifacts.put_json("pull_request.json", {"html_url": pr_url, "via": "gh"})
+
+            print(_json.dumps({"status": "success", "pr": pr_url, "changed": total_changed}, indent=2))
+
         except Exception as e:
-            print(json.dumps({"status":"partial","message":"Updated locally; PR not opened",
-                              "error":str(e), "changed": total_changed}, indent=2))
+            print(_json.dumps({"status":"partial","message":"Updated locally; PR not opened",
+                               "error":str(e), "changed": total_changed}, indent=2))
     else:
-        print(json.dumps({"status":"success","message":"Updated locally (no PR)",
-                          "changed": total_changed}, indent=2))
+        print(_json.dumps({"status":"success","message":"Updated locally (no PR)",
+                           "changed": total_changed}, indent=2))
 
 
 def main():
