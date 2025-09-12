@@ -20,23 +20,31 @@ class OpenAIChatLLM:
                 suggestions = []
 
                 for ident in identifiers:
-                    # Heuristic logical name guesses
+                    # -------- Heuristic logical name guesses --------
                     if ident.startswith("product_sku_"):
+                        # name might be 'cap', 'cap_5454', 'shirt_val222', etc.
                         name = ident.split("product_sku_", 1)[-1]
+
+                        # strip common noisy suffixes so we map to canonical logicals
+                        #   *_123, *_val123, *_val8998, etc.
+                        base = re.sub(r"(_val?\d+)$", "", name)   # _v123 or _val123 or _val8998
+                        base = re.sub(r"(_\d{2,})$", "", base)     # trailing _1234, _5454, etc.
+
                         known = {
-                            "hoodie": "us.mappings.yourOrders.hoodieProduct",
-                            "cap": "us.mappings.yourOrders.capProduct",
-                            "shirt": "us.mappings.yourOrders.shirtProduct",
-                            "bottle": "us.mappings.yourOrders.bottleProduct",
+                            "hoodie":     "us.mappings.yourOrders.hoodieProduct",
+                            "cap":        "us.mappings.yourOrders.capProduct",
+                            "shirt":      "us.mappings.yourOrders.shirtProduct",
+                            "bottle":     "us.mappings.yourOrders.bottleProduct",
                             "headphones": "us.mappings.yourOrders.headphonesProduct",
-                            "vip": "us.mappings.yourOrders.vipProduct",
+                            "vip":        "us.mappings.yourOrders.vipProduct",
+                            "mug":        "us.mappings.yourOrders.mugProduct",   # NEW
                         }
-                        logical = known.get(name, f"us.mappings.catalog.{name}Product")
+                        logical = known.get(base, f"us.mappings.catalog.{base}Product")
                     else:
                         safe = re.sub(r"[^a-zA-Z0-9]+", "_", ident).strip("_")
                         logical = f"us.mappings.auto.{safe}"
 
-                    # Platform locators
+                    # -------- Platform locators --------
                     if platform == "react_native":
                         android = f"//*[@content-desc='{ident}'] | //*[@resource-id='{ident}']"
                         ios = f"//*[@name='{ident}']"
