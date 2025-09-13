@@ -1,6 +1,6 @@
 # autoheal/identifier_extractor.py
 from __future__ import annotations
-import os, re, yaml
+import os, re, glob, yaml
 from typing import Dict, Any, List, Tuple, Optional
 
 # ---------------- IO helpers ----------------
@@ -21,7 +21,7 @@ def _walk(root: str, exts: Tuple[str, ...]) -> List[str]:
 # ---------------- config helpers ----------------
 def _load_yaml(path: str) -> Dict[str, Any]:
     try:
-        return yaml.safe_load(open(path, "r", encoding="utf-8"))
+        return yaml.safe_load(open(path, "r", encoding="utf-8")) or {}
     except Exception:
         return {}
 
@@ -35,20 +35,14 @@ def load_app_mapping(config_path: str) -> Dict[str, Any]:
 
 # ---------------- RN locators shim (for YAML style) ----------------
 def rn_value_to_platform_locators(testid_value: str) -> dict:
-    """
-    Given a React Native testID value, produce cross-platform locators
-    compatible with your YAML mappings.
-    """
+    """Given a RN testID value, produce cross-platform locators compatible with your YAML mappings."""
     android = f"//*[@content-desc='{testid_value}'] | //*[@resource-id='{testid_value}']"
     ios = f"//*[@name='{testid_value}']"
     return {"android": android, "ios": ios}
 
 # ---------------- pattern & fuzzy matching ----------------
 def map_by_patterns(value: str, patterns: List[Dict[str, str]]) -> Optional[str]:
-    """
-    patterns: [{match: '^regex$', logical: 'us.mappings....'}, ...]
-    returns logical name or None
-    """
+    """patterns: [{match: '^regex$', logical: 'us.mappings....'}, ...] -> logical or None"""
     for p in patterns or []:
         try:
             if re.search(p.get("match", ""), value):
@@ -68,23 +62,39 @@ def normalize_base(value: str) -> str:
     v = re.sub(r"[_-]val\d+$", "", v, flags=re.IGNORECASE)  # _valNN or -valNN
     v = re.sub(r"\d+$", "", v)                              # trailing digits
     v = re.sub(r"(Premium|Plus|Deluxe|V\d+)$", "", v, flags=re.IGNORECASE)
-    v = re.sub(r"[_-]+$", "", v)                            # <--- remove leftover trailing _ or -
+    v = re.sub(r"[_-]+$", "", v)                            # remove leftover trailing _ or -
     return v
 
 def map_by_fuzzy(value: str, exact_map: Dict[str, str]) -> Optional[str]:
     base = normalize_base(value)
     if base in exact_map:
         return exact_map[base]
-    for k, logical in exact_map.items():
+    for k, logical in (exact_map or {}).items():
         if value.startswith(k) or base.startswith(k):
             return logical
     return None
 
-# ---------------- Extractors ----------------
-# Quoted strings: testID: 'x' | testID: "x" | testId = 'x'
-RN_TESTID_QUOTED = re.compile(r"\btest[Ii]d\s*[:=]\s*['\"]([^'\"\n]+)['\"]")
-# Template literals: testID: `x`
-RN_TESTID_TEMPLATE = re.compile(r"\btest[Ii]d\s*[:=]\s*`([^`\n]+)`")
+# ---------------- RN extractors ----------------
+# Catch: testID: "x" | testId = 'x' | testID={'x'} | testID={`x`}
+TESTID_REGEXES = [
+    re.compile(r"\btest[Ii]d\s*[:=]\s*{?\s*(['\"])([^'\"\n]+)\1\s*}?", re.MULTILINE),
+    re.compile(r"\btest[Ii]d\s*[:=]\s*{?\s*`([^`\n]+)`\s*}?", re.MULTILINE),
+]
+
+def _scan_files_for_testids(paths: List[str]) -> List[str]:
+    found = set()
+    for p in paths:
+        try:
+            s = _read(p)
+            for rx in TESTID_REGEXES:
+                for m in rx.finditer(s):
+                    # Pattern 1 has 2 capture groups, pattern 2 has 1
+                    val = m.group(2) if rx.groups == 2 else m.group(1)
+                    if val:
+                        found.add(val.strip())
+        except Exception:
+            pass
+    return sorted(found)
 
 def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
     """
@@ -92,23 +102,22 @@ def extract_rn_testids(app_repo: str, config_path: str) -> List[str]:
     (falls back to scanning the repo if not configured).
     """
     files_cfg = load_source_files(config_path).get("react_native", [])
-    files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
+    files: List[str] = []
+    for rel in files_cfg:
+        abs_glob = os.path.join(app_repo, rel)
+        files.extend(glob.glob(abs_glob, recursive=True))
     if not files:
-        files = _walk(app_repo, (".ts", ".tsx", ".js", ".jsx"))
+        files = (
+            glob.glob(os.path.join(app_repo, "**/*.ts"), recursive=True)
+            + glob.glob(os.path.join(app_repo, "**/*.tsx"), recursive=True)
+            + glob.glob(os.path.join(app_repo, "**/*.js"), recursive=True)
+            + glob.glob(os.path.join(app_repo, "**/*.jsx"), recursive=True)
+        )
+    return _scan_files_for_testids(files)
 
-    seen: Dict[str, None] = {}
-    for p in files:
-        txt = _read(p)
-        for m in RN_TESTID_QUOTED.finditer(txt):
-            seen.setdefault(m.group(1).strip(), None)
-        for m in RN_TESTID_TEMPLATE.finditer(txt):
-            seen.setdefault(m.group(1).strip(), None)
-    return list(seen.keys())
-
+# ---------------- iOS / Android extractors ----------------
 def extract_ios_identifiers(app_repo: str, config_path: str) -> List[str]:
-    """
-    Collect iOS accessibilityIdentifier values; also capture common *SettingsButton names.
-    """
+    """Collect iOS accessibilityIdentifier values; also capture common *SettingsButton names."""
     files_cfg = load_source_files(config_path).get("ios_native", [])
     files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
     if not files:
@@ -126,9 +135,7 @@ def extract_ios_identifiers(app_repo: str, config_path: str) -> List[str]:
     return list(ios_ids.keys())
 
 def extract_android_identifiers(app_repo: str, config_path: str) -> List[str]:
-    """
-    Collect Android resource-ids and contentDescription values (and fully qualified debug ids).
-    """
+    """Collect Android resource-ids and contentDescription values (and fully qualified debug ids)."""
     files_cfg = load_source_files(config_path).get("android_native", [])
     files = [os.path.join(app_repo, p) for p in files_cfg if os.path.exists(os.path.join(app_repo, p))]
     if not files:
@@ -191,14 +198,11 @@ def choose_logical_generic(
       3) fuzzy fallback using normalize_base/_valN/Premium/etc.
     Returns the logical name or None.
     """
-    # 1) exact match
     if value in exact_map:
         return exact_map[value]
-    # 2) regex patterns
     m = map_by_patterns(value, patterns)
     if m:
         return m
-    # 3) fuzzy fallback against keys in exact_map
     return map_by_fuzzy(value, exact_map)
 
 __all__ = [
