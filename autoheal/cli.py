@@ -321,7 +321,6 @@ def heal_text_rename(
     else:
         print(json.dumps({"status": "success", "message": "Applied rename locally (no PR)"}, indent=2))
 
-
 def update_mappings_by_name(
     tests_repo: str,
     logical_name: str,
@@ -393,40 +392,40 @@ def update_mappings_from_app(
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-   # ---- Snapshot app + llm config for observability ----
-app_cfg = getattr(cfg, "app", {}) or {}
-llm_cfg = getattr(cfg, "llm", {}) or {}
+    # ---- Snapshot app + llm config for observability ----
+    app_cfg = getattr(cfg, "app", {}) or {}
+    llm_cfg = getattr(cfg, "llm", {}) or {}
 
-def _grab(obj, key, default=None):
-    # Works for dicts or config objects (dataclass/attrs)
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+    def _grab(obj, key, default=None):
+        # Works for dicts or config objects (dataclass/attrs)
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
 
-artifacts.put_json("config_app_snapshot.json", {
-    "app": {
-        "platform": _grab(app_cfg, "platform"),
-        "testid_to_logical": _grab(app_cfg, "testid_to_logical") or {},
-        "testid_patterns": _grab(app_cfg, "testid_patterns") or [],
-        "ios_to_logical": _grab(app_cfg, "ios_to_logical") or {},
-        "ios_patterns": _grab(app_cfg, "ios_patterns") or [],
-        "android_to_logical": _grab(app_cfg, "android_to_logical") or {},
-        "android_patterns": _grab(app_cfg, "android_patterns") or [],
-    },
-    "llm": {
-        "provider": _grab(llm_cfg, "provider"),
-        "model": _grab(llm_cfg, "model"),
-        "temperature": _grab(llm_cfg, "temperature"),
-    }
-})
+    artifacts.put_json("config_app_snapshot.json", {
+        "app": {
+            "platform": _grab(app_cfg, "platform"),
+            "testid_to_logical": _grab(app_cfg, "testid_to_logical") or {},
+            "testid_patterns": _grab(app_cfg, "testid_patterns") or [],
+            "ios_to_logical": _grab(app_cfg, "ios_to_logical") or {},
+            "ios_patterns": _grab(app_cfg, "ios_patterns") or [],
+            "android_to_logical": _grab(app_cfg, "android_to_logical") or {},
+            "android_patterns": _grab(app_cfg, "android_patterns") or [],
+        },
+        "llm": {
+            "provider": _grab(llm_cfg, "provider"),
+            "model": _grab(llm_cfg, "model"),
+            "temperature": _grab(llm_cfg, "temperature"),
+        }
+    })
 
-platform      = _grab(app_cfg, "platform", "react_native")
-rn_map        = _grab(app_cfg, "testid_to_logical", {}) or {}
-rn_patterns   = _grab(app_cfg, "testid_patterns", []) or []
-ios_map       = _grab(app_cfg, "ios_to_logical", {}) or {}
-ios_patterns  = _grab(app_cfg, "ios_patterns", []) or []
-android_map   = _grab(app_cfg, "android_to_logical", {}) or {}
-android_patts = _grab(app_cfg, "android_patterns", []) or []
+    platform      = _grab(app_cfg, "platform", "react_native")
+    rn_map        = _grab(app_cfg, "testid_to_logical", {}) or {}
+    rn_patterns   = _grab(app_cfg, "testid_patterns", []) or {}
+    ios_map       = _grab(app_cfg, "ios_to_logical", {}) or {}
+    ios_patterns  = _grab(app_cfg, "ios_patterns", []) or {}
+    android_map   = _grab(app_cfg, "android_to_logical", {}) or {}
+    android_patts = _grab(app_cfg, "android_patterns", []) or {}
 
     # ---- Discover identifiers from app repo ----
     discovered = extract_identifiers(app_repo, platform, config_path)
@@ -446,40 +445,42 @@ android_patts = _grab(app_cfg, "android_patterns", []) or []
     artifacts.put_json("identifiers_discovered_runtime.json", {
         "platform": platform,
         "ids": ids,
-        "rn_map_keys": list(rn_map.keys()),
+        "rn_map_keys": list(rn_map.keys()) if isinstance(rn_map, dict) else [],
         "rn_patterns": rn_patterns,
-        "ios_map_keys": list(ios_map.keys()),
+        "ios_map_keys": list(ios_map.keys()) if isinstance(ios_map, dict) else [],
         "ios_patterns": ios_patterns,
-        "android_map_keys": list(android_map.keys()),
+        "android_map_keys": list(android_map.keys()) if isinstance(android_map, dict) else [],
         "android_patterns": android_patts,
     })
 
-    # ---- LLM wiring (log what backend is configured; no secrets) ----
+    # ---- LLM wiring (log which backend/model is configured; no secrets) ----
     log.info(f"LLM provider={cfg.llm.provider} model={cfg.llm.model}")
     _write_llm_info_artifact(artifacts, cfg.llm.provider, cfg.llm.model, cfg.llm.temperature)
     llm = get_llm(cfg.llm.provider, cfg.llm.openai_api_key, cfg.llm.anthropic_api_key,
                   cfg.llm.model, cfg.llm.temperature)
 
     # ---- Rule-based mapping pass to find already-known IDs ----
-    rule_mapped = set()
+    rule_mapped: set[str] = set()
     updates: List[Tuple[str, str, str]] = []  # (logical, android_locator, ios_locator)
 
     if platform == "react_native":
         for testid in ids:
-            ln = choose_logical_for_rn(testid, rn_map, rn_patterns)
+            ln = choose_logical_for_rn(testid, rn_map, rn_patterns if isinstance(rn_patterns, list) else [])
             if ln:
                 rule_mapped.add(testid)
                 locs = rn_value_to_platform_locators(testid)
                 updates.append((ln, locs["android"], locs["ios"]))
+
     elif platform == "ios_native":
         for ios_id in ids:
-            ln = choose_logical_generic(ios_id, ios_map, ios_patterns)
+            ln = choose_logical_generic(ios_id, ios_map, ios_patterns if isinstance(ios_patterns, list) else [])
             if ln:
                 rule_mapped.add(ios_id)
                 updates.append((ln, "", f"//*[@name='{ios_id}']"))
+
     elif platform == "android_native":
         for aid in ids:
-            ln = choose_logical_generic(aid, android_map, android_patts)
+            ln = choose_logical_generic(aid, android_map, android_patts if isinstance(android_patts, list) else [])
             if ln:
                 rule_mapped.add(aid)
                 if ":" in aid:
@@ -494,7 +495,7 @@ android_patts = _grab(app_cfg, "android_patterns", []) or []
     if unmapped:
         ctx = {
             "rn_map": rn_map,
-            "rn_patterns": rn_patterns,
+            "rn_patterns": rn_patterns if isinstance(rn_patterns, list) else [],
             "ios_map": ios_map,
             "android_map": android_map,
         }
@@ -502,9 +503,11 @@ android_patts = _grab(app_cfg, "android_patterns", []) or []
 
     # Merge LLM suggestions into updates
     for s in llm_suggestions:
-        ln = (s or {}).get("logical")
-        a  = (s or {}).get("android", "")
-        i  = (s or {}).get("ios", "")
+        if not isinstance(s, dict):
+            continue
+        ln = s.get("logical")
+        a  = s.get("android", "")
+        i  = s.get("ios", "")
         if ln and (a or i):
             updates.append((ln, a, i))
 
@@ -573,7 +576,6 @@ android_patts = _grab(app_cfg, "android_patterns", []) or []
             pr = gh.open_pr(title=commit_msg, head=branch, base="main",
                             body="Automated update based on app source changes")
 
-            # Save PR both under artifacts AND at repo root for the workflow step
             artifacts.put_json("pull_request.json", pr)
             try:
                 with open(os.path.join(tests_repo, "pull_request.json"), "w", encoding="utf-8") as f:
@@ -588,7 +590,6 @@ android_patts = _grab(app_cfg, "android_patterns", []) or []
     else:
         print(json.dumps({"status":"success","message":"Updated locally (no PR)",
                           "changed": total_changed}, indent=2))
-
 def main():
     ap = argparse.ArgumentParser(description="Autoheal CLI (LLM + RAG + deterministic updaters)")
     sub = ap.add_subparsers(dest="cmd")
