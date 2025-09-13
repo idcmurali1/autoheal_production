@@ -393,25 +393,40 @@ def update_mappings_from_app(
     cfg = load_config(config_path)
     artifacts = ArtifactStore(cfg.artifact_store.path)
 
-    # ---- Snapshot app + llm config for observability ----
-    app_cfg = getattr(cfg, "app", {}) or {}
-    llm_cfg = getattr(cfg, "llm", {}) or {}
-    artifacts.put_json("config_app_snapshot.json", {
-        "app": app_cfg,
-        "llm": {
-            "provider": llm_cfg.get("provider"),
-            "model": llm_cfg.get("model"),
-            "temperature": llm_cfg.get("temperature"),
-        }
-    })
+   # ---- Snapshot app + llm config for observability ----
+app_cfg = getattr(cfg, "app", {}) or {}
+llm_cfg = getattr(cfg, "llm", {}) or {}
 
-    platform      = app_cfg.get("platform", "react_native")
-    rn_map        = app_cfg.get("testid_to_logical", {}) or {}
-    rn_patterns   = app_cfg.get("testid_patterns", []) or []
-    ios_map       = app_cfg.get("ios_to_logical", {}) or {}
-    ios_patterns  = app_cfg.get("ios_patterns", []) or []
-    android_map   = app_cfg.get("android_to_logical", {}) or {}
-    android_patts = app_cfg.get("android_patterns", []) or []
+def _grab(obj, key, default=None):
+    # Works for dicts or config objects (dataclass/attrs)
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+artifacts.put_json("config_app_snapshot.json", {
+    "app": {
+        "platform": _grab(app_cfg, "platform"),
+        "testid_to_logical": _grab(app_cfg, "testid_to_logical") or {},
+        "testid_patterns": _grab(app_cfg, "testid_patterns") or [],
+        "ios_to_logical": _grab(app_cfg, "ios_to_logical") or {},
+        "ios_patterns": _grab(app_cfg, "ios_patterns") or [],
+        "android_to_logical": _grab(app_cfg, "android_to_logical") or {},
+        "android_patterns": _grab(app_cfg, "android_patterns") or [],
+    },
+    "llm": {
+        "provider": _grab(llm_cfg, "provider"),
+        "model": _grab(llm_cfg, "model"),
+        "temperature": _grab(llm_cfg, "temperature"),
+    }
+})
+
+platform      = _grab(app_cfg, "platform", "react_native")
+rn_map        = _grab(app_cfg, "testid_to_logical", {}) or {}
+rn_patterns   = _grab(app_cfg, "testid_patterns", []) or []
+ios_map       = _grab(app_cfg, "ios_to_logical", {}) or {}
+ios_patterns  = _grab(app_cfg, "ios_patterns", []) or []
+android_map   = _grab(app_cfg, "android_to_logical", {}) or {}
+android_patts = _grab(app_cfg, "android_patterns", []) or []
 
     # ---- Discover identifiers from app repo ----
     discovered = extract_identifiers(app_repo, platform, config_path)
